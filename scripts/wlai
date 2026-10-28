@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${WLAI_PYTHON:-}" ]; then
+    python_bin=$WLAI_PYTHON
+elif [ -x "$script_dir/.venv/bin/python" ]; then
+    python_bin=$script_dir/.venv/bin/python
+else
+    python_bin=python3
+fi
+exec "$python_bin" "$script_dir/cli.py" "$@"

@@ -1,0 +1,14 @@
+{
+  "portal": "https://aistation.example.edu",
+  "account": "YOUR_ACCOUNT",
+  "ca_file": "~/private/aistation.pem",
+  "certificate_sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_A_TRUSTED_SOURCE",
+  "ssh_host_fingerprint": "SHA256:REPLACE_WITH_VERIFIED_CONTAINER_HOST_FINGERPRINT",
+  "development_group_id": "YOUR_DEVELOPMENT_GROUP_ID",
+  "image": "registry.example.edu/team/pytorch:tag",
+  "framework": "pytorch",
+  "card_type": "YOUR_GPU_MODEL",
+  "persistent_root": "/YOUR_ACCOUNT/compute_runs",
+  "remote_python": "/opt/conda/bin/python",
+  "max_environment_seconds": 14400
+}
