@@ -23,6 +23,7 @@ def verify_mount(mountinfo, storage_mount, run_dir):
     if not storage_mount.startswith('/') or storage_mount in ('/', '/tmp', '/root') or not _inside(run_dir, storage_mount):
         raise StorageError('Run directory must stay within the configured personal storage mount')
     candidates = []
+    run_candidates = []
     for line in mountinfo.splitlines():
         before, separator, after = line.partition(' - ')
         fields, filesystem = before.split(), after.split()
@@ -32,11 +33,21 @@ def verify_mount(mountinfo, storage_mount, run_dir):
         if target != '/' and _inside(storage_mount, target):
             candidates.append({'mount_point': target, 'filesystem': filesystem[0],
                                'source': _unescape(filesystem[1])})
+        if target != '/' and _inside(run_dir, target):
+            run_candidates.append({'mount_point': target, 'filesystem': filesystem[0],
+                                   'source': _unescape(filesystem[1])})
     if not candidates:
         raise StorageError('No independent mount covers the configured personal storage; no directory was created')
     selected = max(candidates, key=lambda row: len(row['mount_point']))
+    if sum(row['mount_point'] == selected['mount_point'] for row in candidates) != 1:
+        raise StorageError('Stacked mounts make the configured storage ambiguous; no write was attempted')
     if selected['filesystem'].lower() in {'overlay', 'tmpfs', 'ramfs', 'proc', 'sysfs', 'devtmpfs', 'devpts'}:
         raise StorageError('Configured storage resolves to an ephemeral/virtual filesystem')
+    actual = max(run_candidates, key=lambda row: len(row['mount_point']))
+    if sum(row['mount_point'] == actual['mount_point'] for row in run_candidates) != 1:
+        raise StorageError('Stacked mounts make the run directory ambiguous; no write was attempted')
+    if actual['mount_point'] != selected['mount_point']:
+        raise StorageError('A nested mount covers the run directory; explicitly configure and verify that mount before writing')
     return dict(selected, storage_mount=storage_mount, run_dir=run_dir,
                 mount_verified=True, group_quota_verified=False)
 

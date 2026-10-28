@@ -11,7 +11,7 @@ import tempfile
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument('--version', action='version', version='westlake-aistation 0.2.0-preview.1')
+    root.add_argument('--version', action='version', version='westlake-aistation 0.2.0-preview.2')
     root.add_argument('--profile', type=Path, help='Private, nonsecret connection profile')
     root.add_argument('--state-dir', type=Path, help='Override the account-scoped run registry')
     root.add_argument('--non-interactive', action='store_true', help='Never prompt for a password')

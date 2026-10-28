@@ -4,7 +4,7 @@
 
 Community CLI and Codex skill. This is not an official university SDK, and the manual does not promise compatibility with these observed API endpoints.
 
-**预览版 `v0.2.0-preview.1`：公开改版尚未取得实机 GPU 全流程 PASS。此前检查通过了资源申请和实际 V100 型号核验，但共享目录创建超时；测试资源已释放。自动测试通过不能替代自己部署的小任务验证。**
+**预览版 `v0.2.0-preview.2`：公开改版尚未取得实机 GPU 全流程 PASS。此前检查通过了资源申请和实际 V100 型号核验，但共享目录创建超时；测试资源已释放。自动测试通过不能替代自己部署的小任务验证。**
 
 ## 安装
 

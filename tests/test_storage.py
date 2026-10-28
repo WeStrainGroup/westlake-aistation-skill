@@ -46,6 +46,17 @@ class StorageTests(unittest.TestCase):
         escaped = '5 1 0:5 / /data\\040space rw - ext4 /dev/example rw\n'
         self.assertEqual(verify_mount(ROOT + escaped, '/data space', '/data space/run')['mount_point'], '/data space')
 
+    def test_nested_mount_cannot_hide_behind_verified_personal_storage(self):
+        for kind, source in [('tmpfs', 'tmpfs'), ('ext4', '/dev/other')]:
+            nested = f'4 2 0:4 / /example/runs rw - {kind} {source} rw\n'
+            with self.subTest(kind=kind), self.assertRaises(StorageError):
+                verify_mount(ROOT + MASTER + nested, '/example', '/example/runs/id')
+
+    def test_stacked_mounts_are_rejected_when_visible_filesystem_is_ambiguous(self):
+        shadow = '4 2 0:4 / /example rw - tmpfs tmpfs rw\n'
+        with self.assertRaises(StorageError):
+            verify_mount(ROOT + MASTER + shadow, '/example', '/example/runs/id')
+
     def test_probe_write_read_remove_and_space_do_not_claim_group_quota(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / 'runs' / 'unique'
