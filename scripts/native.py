@@ -163,20 +163,20 @@ def build_task_payload(spec, project_id=None):
     if spec.get('guard_manifest'):
         # Both files are immutable inputs to this command. Hash both complete
         # buffers before exposing the manifest or compiling the guard source.
-        loader = ("import base64,hashlib,sys;from pathlib import Path\ns=Path(" + repr(spec['guard_script'])
-                  + ").read_bytes();m=Path(" + repr(spec['guard_manifest']) + ").read_bytes()\n"
-                  + "if hashlib.sha256(s).hexdigest()!=" + repr(spec['guard_script_sha256'])
-                  + " or hashlib.sha256(m).hexdigest()!=" + repr(hashlib.sha256(manifest_bytes).hexdigest())
-                  + ":raise SystemExit('WLAI_NATIVE_FILE_SHA256_MISMATCH')\n"
-                  + "sys.argv[1:]=[base64.urlsafe_b64encode(m).decode('ascii')]\n"
+        loader = ("import base64,hashlib,sys;from pathlib import Path;s=Path(" + repr(spec['guard_script'])
+                  + ").read_bytes();m=Path(" + repr(spec['guard_manifest']) + ").read_bytes();"
+                  + "(hashlib.sha256(s).hexdigest()==" + repr(spec['guard_script_sha256'])
+                  + " and hashlib.sha256(m).hexdigest()==" + repr(hashlib.sha256(manifest_bytes).hexdigest())
+                  + ") or sys.exit('WLAI_NATIVE_FILE_SHA256_MISMATCH');"
+                  + "sys.argv[1:]=[base64.urlsafe_b64encode(m).decode('ascii')];"
                   + "exec(compile(s,'<wlai_native_guard>','exec'))")
     elif spec.get('guard_script'):
         # Compile the same bytes that were hashed; never reopen the staged file
         # after verification or use assert (which Python optimization can skip).
-        loader = ("import hashlib;from pathlib import Path\ns=Path("
-                  + repr(spec['guard_script']) + ").read_bytes()\n"
-                  + "if hashlib.sha256(s).hexdigest()!=" + repr(spec['guard_script_sha256'])
-                  + ": raise SystemExit('WLAI_NATIVE_GUARD_SHA256_MISMATCH')\n"
+        loader = ("import hashlib,sys;from pathlib import Path;s=Path("
+                  + repr(spec['guard_script']) + ").read_bytes();"
+                  + "(hashlib.sha256(s).hexdigest()==" + repr(spec['guard_script_sha256'])
+                  + ") or sys.exit('WLAI_NATIVE_GUARD_SHA256_MISMATCH');"
                   + "exec(compile(s," + repr(spec['guard_script']) + ",'exec'))")
     else:
         runner = Path(__file__).with_name('native_runner.py').read_bytes()

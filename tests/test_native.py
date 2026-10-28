@@ -168,6 +168,18 @@ class NativeTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 prepare_task_spec(dict(self.spec, guard_script=path), PROFILE)
 
+    def test_all_guard_commands_are_single_line_including_literal_multiline_argv(self):
+        for mode in ('embedded', 'staged', 'staged-files'):
+            with self.subTest(mode=mode):
+                source = dict(self.spec, argv=self.spec['argv'] + ['literal\nargument\rvalue'])
+                if mode != 'embedded':
+                    source['guard_script'] = '/sample-user/tools/native_runner.py'
+                if mode == 'staged-files':
+                    source['guard_manifest'] = '/sample-user/manifests/example.json'
+                command = build_task_payload(prepare_task_spec(source, PROFILE))['command']
+                self.assertNotIn('\n', command)
+                self.assertNotIn('\r', command)
+
     def local_staged_guard(self):
         root = Path(self.directory.name)
         script = root / "native runner '; 源.py"
