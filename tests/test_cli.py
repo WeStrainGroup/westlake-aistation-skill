@@ -72,6 +72,20 @@ class CLITests(unittest.TestCase):
                 cluster.assert_not_called()
                 self.assertEqual(json.loads(output.getvalue())[0]['run_id'], 'local_run')
 
+    def test_task_stop_exit_status_requires_confirmed_release(self):
+        profile = {'portal': 'https://aistation.example.edu', 'account': 'sample_user'}
+        cases = [({'state': 'STOP_REQUESTED', 'resource_released': False}, 2),
+                 ({'state': 'CANCELLED', 'resource_released': True}, 0),
+                 ({'state': 'FAILED', 'resource_released': True}, 0),
+                 ({'state': 'UNKNOWN', 'resource_released': False}, 2)]
+        for result, expected in cases:
+            with self.subTest(result=result), patch('config.load_profile', return_value=profile), \
+                 patch('native.NativeTasks') as tasks, contextlib.redirect_stdout(io.StringIO()):
+                tasks.return_value.stop.return_value = result
+                self.assertEqual(cli.main(['task-stop', '--run-id', 'example', '--timeout', '15',
+                                           '--interval', '0.2']), expected)
+                tasks.return_value.stop.assert_called_once_with('example', timeout=15.0, interval=0.2)
+
     def test_system_store_read_requires_explicit_global_choice(self):
         fake = {'account': 'sample_user', 'portal': 'https://aistation.example.edu'}
         class FakeClient:

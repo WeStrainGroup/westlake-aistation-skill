@@ -32,6 +32,8 @@ _SAFE_PLATFORM_MESSAGES = {
         "The request duplicates a personal-directory mount already provided by the platform.",
     "IRESOURCE_STRING_LENGTH_ILLEGAL":
         "A request field exceeds the platform's length limit; inspect command_bytes and the deployment's documented limits before another diagnostic.",
+    "IRESOURCE_STOP_TRAIN_JOB_FAILED":
+        "The platform rejected stopping this task; refresh its state. Queued or starting tasks require cancellation, while Running tasks use stop.",
     "COMMON_PARAMETER_NOT_MATCH":
         "The platform rejected a parameter; check the request schema for this deployment.",
 }

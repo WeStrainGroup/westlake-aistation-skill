@@ -33,6 +33,7 @@ class FakeAPI:
         self.no_visibility = False
         self.receipt = False
         self.log_data = None
+        self.pod_data = {'total': 0, 'data': []}
     def call(self, method, path, params=None, body=None):
         self.calls.append((method, path, copy.deepcopy(params), copy.deepcopy(body)))
         if method == 'GET' and path.endswith('/node-group'):
@@ -41,6 +42,8 @@ class FakeAPI:
             return {'data': [{'groupId': 'training-group', 'nodeName': 'example-node', 'cardType': 'Example GPU',
                               'cpu': 48, 'cpuUsage': 0, 'acceleratorCard': 4,
                               'acceleratorCardUsage': 4 if self.busy else 0}]}
+        if method == 'GET' and path.endswith('/job-pod-instance'):
+            return copy.deepcopy(self.pod_data)
         if method == 'GET' and path.endswith('/train'):
             if self.no_visibility:
                 return {'data': []}
@@ -65,6 +68,11 @@ class FakeAPI:
             if self.raise_after_create:
                 raise ConnectionError('synthetic-hidden-transport-detail')
             return {'id': row['id']}
+        if method == 'DELETE' and path == '/api/iresource/v1/train':
+            assert body['endTaskListFlag'] is False
+            for task_id in body['jobIdList']:
+                self.tasks[task_id]['status'] = 'Stopped'
+            return None
         if method == 'POST' and path.endswith('/stop'):
             task_id = path.split('/')[-2]
             self.tasks[task_id]['status'] = 'Stopped'
@@ -87,7 +95,7 @@ class FakeAPI:
     def count_creates(self):
         return sum(method == 'POST' and path.endswith('/train') for method, path, *_ in self.calls)
     def count_stops(self):
-        return sum(method == 'POST' and path.endswith('/stop') for method, path, *_ in self.calls)
+        return sum(method == 'POST' and path.endswith('/stop') or method == 'DELETE' and path == '/api/iresource/v1/train' for method, path, *_ in self.calls)
 
 
 class NativeTests(unittest.TestCase):
@@ -596,6 +604,300 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(result['gpu_config_verified'])
         self.assertEqual(self.api.count_stops(), 1)
         self.assertFalse(any('work-platform' in path for method, path, *_ in self.api.calls))
+
+    def _running_task(self):
+        result = self.client.submit(self.spec, execute=True)
+        self.api.tasks[result['task_id']]['status'] = 'Running'
+        return result['task_id']
+
+    def test_invisible_stop_does_not_mutate_and_later_visible_stop_recovers_legacy_intent(self):
+        self._running_task()
+        self.client.registry.update('example', stop_requested=True, stop_uncertain=True)
+        self.api.no_visibility = True
+        first = self.client.stop('example')
+        self.assertFalse(first['resource_released'])
+        self.assertFalse(first['stop_confirmed'])
+        self.assertTrue(first['stop_uncertain'])
+        self.assertEqual(self.api.count_stops(), 0)
+        self.api.no_visibility = False
+        second = self.client.stop('example')
+        self.assertTrue(second['resource_released'])
+        self.assertTrue(second['stop_confirmed'])
+        self.assertFalse(second['stop_uncertain'])
+        self.assertEqual(self.api.count_stops(), 1)
+
+    def test_running_stop_uses_post_without_body(self):
+        task_id = self._running_task()
+        result = self.client.stop('example')
+        self.assertTrue(result['resource_released'])
+        self.assertTrue(result['stop_confirmed'])
+        requests = [(method, path, body) for method, path, _, body in self.api.calls if method != 'GET']
+        self.assertEqual(requests[-1], ('POST', '/api/iresource/v1/train/' + task_id + '/stop', None))
+        self.assertEqual(result['stop_action'], 'stop_running')
+        self.assertTrue(result['stop_attempts'][-1]['accepted'])
+
+    def test_each_queued_state_uses_only_unfinished_delete(self):
+        for index, platform in enumerate(('Pending', 'Queuing', 'ImagePulling', 'DatasetPulling')):
+            with self.subTest(platform=platform):
+                spec = prepare_task_spec(dict(self.spec, run_id='queued_' + str(index), task_name='queued_' + str(index)), PROFILE)
+                task_id = self.client.submit(spec, execute=True)['task_id']
+                self.api.tasks[task_id]['status'] = platform
+                other = copy.deepcopy(self.api.tasks[task_id]); other.update(id='unrelated', userId='someone-else')
+                self.api.tasks['unrelated'] = other
+                result = self.client.stop(spec['run_id'])
+                self.assertTrue(result['resource_released'])
+                mutations = [(method, path, body) for method, path, _, body in self.api.calls if method == 'DELETE']
+                self.assertEqual(mutations[-1], ('DELETE', '/api/iresource/v1/train',
+                    {'jobIdList': [task_id], 'endTaskListFlag': False}))
+                self.assertEqual(self.api.tasks['unrelated']['status'], platform)
+                self.assertEqual(result['stop_platform_state'], platform)
+                self.assertEqual(result['stop_action'], 'cancel_unfinished')
+
+    def test_explicit_rejection_can_be_retried_by_next_stop_call(self):
+        self._running_task()
+        original = self.api.call
+        attempts = []
+        def first_rejected(method, path, params=None, body=None):
+            if method == 'POST' and path.endswith('/stop'):
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise ApiError('synthetic rejection', code='IRESOURCE_STOP_TRAIN_JOB_FAILED')
+            return original(method, path, params=params, body=body)
+        self.api.call = first_rejected
+        first = self.client.stop('example')
+        self.assertFalse(first['stop_accepted'])
+        self.assertFalse(first['stop_requested'])
+        self.assertTrue(first['stop_rejected'])
+        self.assertFalse(first['resource_released'])
+        second = self.client.stop('example')
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(second['resource_released'])
+        self.assertTrue(second['stop_confirmed'])
+        self.assertEqual(second['stop_attempts'][0]['error']['platform_code'], 'IRESOURCE_STOP_TRAIN_JOB_FAILED')
+
+    def test_legacy_stop_requested_does_not_block_a_new_explicit_stop(self):
+        self._running_task()
+        self.client.registry.update('example', stop_requested=True, stop_uncertain=True)
+        result = self.client.stop('example')
+        self.assertTrue(result['resource_released'])
+        self.assertEqual(self.api.count_stops(), 1)
+
+    def test_stop_rejection_racing_with_terminal_state_confirms_release(self):
+        task_id = self._running_task()
+        original = self.api.call
+        def race(method, path, params=None, body=None):
+            if method == 'POST' and path.endswith('/stop'):
+                self.api.tasks[task_id]['status'] = 'Stopped'
+                raise ApiError('synthetic rejection', code='IRESOURCE_STOP_TRAIN_JOB_FAILED')
+            return original(method, path, params=params, body=body)
+        self.api.call = race
+        result = self.client.stop('example')
+        self.assertTrue(result['resource_released'])
+        self.assertTrue(result['stop_confirmed'])
+        self.assertFalse(result['stop_uncertain'])
+        self.assertEqual(result['state'], 'CANCELLED')
+        self.assertEqual(result['stop_error']['platform_code'], 'IRESOURCE_STOP_TRAIN_JOB_FAILED')
+
+    def test_transport_error_after_server_stop_is_resolved_by_readback(self):
+        task_id = self._running_task()
+        original = self.api.call
+        def accepted_then_disconnected(method, path, params=None, body=None):
+            if method == 'POST' and path.endswith('/stop'):
+                self.api.tasks[task_id]['status'] = 'Stopped'
+                raise TimeoutError('synthetic hidden transport detail')
+            return original(method, path, params=params, body=body)
+        self.api.call = accepted_then_disconnected
+        result = self.client.stop('example')
+        self.assertTrue(result['resource_released'])
+        self.assertTrue(result['stop_confirmed'])
+        self.assertFalse(result['stop_uncertain'])
+        self.assertIsNone(result['stop_accepted'])
+
+    def test_ambiguous_stop_is_not_replayed_in_same_call_and_can_be_retried_explicitly(self):
+        self._running_task()
+        original = self.api.call
+        attempts = []
+        def disconnected(method, path, params=None, body=None):
+            if method == 'POST' and path.endswith('/stop'):
+                attempts.append(path)
+                raise TimeoutError('synthetic hidden transport detail')
+            return original(method, path, params=params, body=body)
+        self.api.call = disconnected
+        clock = [0.0]
+        with patch('native.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('native.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            result = self.client.stop('example', timeout=2, interval=1)
+        self.assertEqual(len(attempts), 1)
+        self.assertTrue(result['stop_uncertain'])
+        self.assertFalse(result['resource_released'])
+        self.api.call = original
+        result = self.client.stop('example')
+        self.assertTrue(result['resource_released'])
+        self.assertTrue(result['stop_confirmed'])
+
+    def test_disappearance_after_queued_cancel_is_not_release_evidence(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        original = self.api.call
+        def disappear(method, path, params=None, body=None):
+            if method == 'DELETE':
+                self.api.tasks.pop(task_id)
+                return None
+            return original(method, path, params=params, body=body)
+        self.api.call = disappear
+        clock = [0.0]
+        with patch('native.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('native.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            result = self.client.stop('example', timeout=2, interval=1)
+        self.assertTrue(result['stop_accepted'])
+        self.assertTrue(result['stop_uncertain'])
+        self.assertFalse(result['stop_confirmed'])
+        self.assertFalse(result['resource_released'])
+
+    def test_terminating_task_is_observed_without_another_mutation(self):
+        task_id = self._running_task()
+        self.api.tasks[task_id]['status'] = 'Terminating'
+        original = self.api.call
+        reads = []
+        def finish(method, path, params=None, body=None):
+            if method == 'GET' and path.endswith('/train'):
+                reads.append(path)
+                if len(reads) > 1:
+                    self.api.tasks[task_id]['status'] = 'Stopped'
+            return original(method, path, params=params, body=body)
+        self.api.call = finish
+        result = self.client.stop('example')
+        self.assertTrue(result['resource_released'])
+        self.assertEqual(self.api.count_stops(), 0)
+        self.assertEqual(result['stop_action'], 'await_termination')
+
+    def test_cancelled_pending_row_requires_delete_flag_and_empty_pods(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        original = self.api.call
+        mutations = []
+        def mark_deleted(method, path, params=None, body=None):
+            if method == 'DELETE':
+                mutations.append(copy.deepcopy(body))
+                self.api.tasks[task_id].update(status='Pending', deleteFlag=True, deleteTime=12345, endTaskWay=1)
+                return {'trainNames': self.spec['task_name']}
+            return original(method, path, params=params, body=body)
+        self.api.call = mark_deleted
+        result = self.client.stop('example')
+        self.assertEqual(result['state'], 'CANCELLED')
+        self.assertEqual(result['platform_state'], 'Pending')
+        self.assertTrue(result['platform_deleted'])
+        self.assertTrue(result['stop_confirmed'])
+        self.assertTrue(result['resource_released'])
+        self.assertEqual(result['release_basis'], 'platform_delete_flag_and_no_active_pods')
+        self.assertEqual(result['cancel_release_evidence']['pod_total'], 0)
+        for operation in (self.client.status, self.client.reconcile,
+                          lambda run: self.client.watch(run, timeout=.01, interval=.001)):
+            observed = operation('example')
+            self.assertEqual(observed['state'], 'CANCELLED')
+            self.assertTrue(observed['resource_released'])
+        self.assertEqual(len(mutations), 1)
+
+    def test_invisible_cancelled_task_needs_exact_owned_ack_and_empty_pods(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        original = self.api.call
+        def remove_and_ack(method, path, params=None, body=None):
+            if method == 'DELETE':
+                self.api.tasks.pop(task_id)
+                return {'trainNames': self.spec['task_name']}
+            return original(method, path, params=params, body=body)
+        self.api.call = remove_and_ack
+        result = self.client.stop('example')
+        self.assertTrue(result['stop_owner_verified'])
+        self.assertEqual(result['cancel_ack_task_name'], self.spec['task_name'])
+        self.assertTrue(result['resource_released'])
+        self.assertEqual(result['release_basis'], 'platform_cancel_ack_and_no_active_pods')
+        self.assertTrue(self.client.status('example')['resource_released'])
+        self.assertTrue(self.client.stop('example')['resource_released'])
+
+    def test_wrong_cancel_ack_cannot_prove_invisible_task_release(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        original = self.api.call
+        def wrong_ack(method, path, params=None, body=None):
+            if method == 'DELETE':
+                self.api.tasks.pop(task_id)
+                return {'trainNames': 'someone_else_task'}
+            return original(method, path, params=params, body=body)
+        self.api.call = wrong_ack
+        clock = [0.0]
+        with patch('native.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('native.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            result = self.client.stop('example', timeout=2, interval=1)
+        self.assertIsNone(result['cancel_ack_task_name'])
+        self.assertFalse(result['resource_released'])
+        self.assertFalse(result['stop_confirmed'])
+
+    def test_delete_flag_without_complete_no_active_pod_evidence_is_not_release(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        self.api.tasks[task_id].update(deleteFlag=True, status='Pending')
+        for data in ({'total': 1, 'data': [{'podStatus': 'Running'}]},
+                     {'total': 1, 'data': [{'podStatus': 'Terminating'}]},
+                     {'total': 2, 'data': [{'podStatus': 'Stopped'}]},
+                     {'data': []}, {'total': True, 'data': []}, {'total': 1, 'data': [{}]}):
+            with self.subTest(data=data):
+                self.api.pod_data = data
+                result = self.client.status('example')
+                self.assertEqual(result['state'], 'STOP_REQUESTED')
+                self.assertFalse(result['resource_released'])
+                self.assertFalse(result['requires_stop'])
+        self.assertEqual(self.api.count_stops(), 0)
+
+    def test_no_delete_flag_or_untrusted_flag_cannot_use_empty_pods_as_terminal_evidence(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        for flag in (None, False, 'true', '1', 1.0):
+            with self.subTest(flag=flag):
+                self.api.tasks[task_id]['deleteFlag'] = flag
+                result = self.client.status('example')
+                self.assertFalse(result['resource_released'])
+        self.assertFalse(any(path.endswith('/job-pod-instance') for _, path, _, _ in self.api.calls))
+        self.api.tasks[task_id]['deleteFlag'] = 1
+        self.assertTrue(self.client.status('example')['resource_released'])
+
+    def test_pod_observation_error_does_not_confirm_deleted_task_release(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        self.api.tasks[task_id]['deleteFlag'] = True
+        original = self.api.call
+        def pod_unavailable(method, path, params=None, body=None):
+            if path.endswith('/job-pod-instance'):
+                raise TimeoutError('synthetic hidden pod error')
+            return original(method, path, params=params, body=body)
+        self.api.call = pod_unavailable
+        result = self.client.status('example')
+        self.assertFalse(result['resource_released'])
+        self.assertEqual(result['cancel_release_error']['type'], 'TimeoutError')
+        self.assertNotIn('synthetic hidden', json.dumps(result))
+
+    def test_accepted_cancel_is_only_observed_by_next_stop_call(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        original = self.api.call
+        mutations = []
+        def accepted_pending(method, path, params=None, body=None):
+            if method == 'DELETE':
+                mutations.append(path)
+                return {'trainNames': self.spec['task_name']}
+            return original(method, path, params=params, body=body)
+        self.api.call = accepted_pending
+        clock = [0.0]
+        with patch('native.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('native.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            first = self.client.stop('example', timeout=2, interval=1)
+            second = self.client.stop('example', timeout=2, interval=1)
+        self.assertTrue(first['stop_accepted'])
+        self.assertFalse(second['resource_released'])
+        self.assertEqual(len(mutations), 1)
+        self.api.tasks[task_id]['deleteFlag'] = True
+        self.assertTrue(self.client.stop('example')['resource_released'])
+        self.assertEqual(len(mutations), 1)
+
+    def test_deleted_marker_is_verified_against_same_owner_before_pod_query(self):
+        task_id = self.client.submit(self.spec, execute=True)['task_id']
+        self.api.tasks[task_id].update(deleteFlag=True, userId='someone-else')
+        with self.assertRaises(RuntimeError):
+            self.client.status('example')
+        self.assertFalse(any(path.endswith('/job-pod-instance') for _, path, _, _ in self.api.calls))
 
     def test_terminal_task_requires_no_pause_or_extra_stop(self):
         self.api.terminal = self.api.receipt = True

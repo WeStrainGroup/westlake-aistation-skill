@@ -11,7 +11,7 @@ import tempfile
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument('--version', action='version', version='westlake-aistation 0.3.0')
+    root.add_argument('--version', action='version', version='westlake-aistation 0.3.1')
     root.add_argument('--profile', type=Path, help='Private, nonsecret connection profile')
     root.add_argument('--state-dir', type=Path, help='Override the account-scoped run registry')
     root.add_argument('--non-interactive', action='store_true', help='Never prompt for a password')
@@ -101,6 +101,9 @@ def parser():
         if name == 'task-watch':
             task.add_argument('--interval', type=float, default=5)
             task.add_argument('--timeout', type=float, default=600, help='Local observing timeout; platform task continues')
+        if name == 'task-stop':
+            task.add_argument('--interval', type=float, default=2)
+            task.add_argument('--timeout', type=float, default=60, help='Wait for confirmed cancellation; timeout does not imply release')
     for name in ('status', 'watch', 'stop', 'reconcile', 'collect', 'logs', 'metrics', 'exec', 'put', 'get', 'storage-check'):
         command = commands.add_parser(name)
         command.add_argument('--run-id', required=True)
@@ -271,7 +274,7 @@ def main(argv=None):
                 elif args.command == 'task-logs':
                     result = tasks.logs(args.run_id)
                 elif args.command == 'task-stop':
-                    result = tasks.stop(args.run_id)
+                    result = tasks.stop(args.run_id, timeout=args.timeout, interval=args.interval)
                 elif args.command == 'task-reconcile':
                     result = tasks.reconcile(args.run_id)
                 else:
@@ -454,6 +457,10 @@ def main(argv=None):
         print(group_table(result))
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.command == 'task-stop' and isinstance(result, dict):
+        # Cancellation success is about confirmed release, independently of a
+        # program's earlier exit code or scientific-output validation state.
+        return 0 if result.get('resource_released') is True else 2
     if isinstance(result, dict) and result.get('state') in ('FAILED', 'TIMED_OUT', 'BLOCKED', 'COLLECTION_FAILED', 'UNKNOWN', 'RESOURCE_MISMATCH', 'COMMAND_MISMATCH', 'REJECTED', 'DELETED', 'COMPLETED_UNVERIFIED'):
         return 2
     if isinstance(result, dict) and result.get('missing_dependencies'):

@@ -584,11 +584,64 @@ class NativeTasks:
                     return False, 'Returned GPU model is not verified against the immutable plan'
         return True, None
 
+    @staticmethod
+    def _is_deleted(row):
+        value = row.get('deleteFlag') if isinstance(row, dict) else None
+        return type(value) in (bool, int) and value == 1
+
+    def _cancel_release_evidence(self, run_id, row=None):
+        """Require owned deletion/ack evidence AND a complete no-active-pod view."""
+        record = self._record(run_id)
+        if row is not None:
+            self._owned(row, record, record['task_id'])
+            if not self._is_deleted(row):
+                return None
+            basis = 'platform_delete_flag_and_no_active_pods'
+        else:
+            if not (record.get('stop_action') == 'cancel_unfinished'
+                    and record.get('stop_accepted') is True
+                    and record.get('stop_owner_verified') is True
+                    and record.get('cancel_ack_task_name') == record['spec']['task_name']):
+                return None
+            basis = 'platform_cancel_ack_and_no_active_pods'
+        try:
+            pods = self.client.call('GET', '/api/iresource/v1/train/job-pod-instance',
+                                    params={'id': str(record['task_id'])})
+        except Exception as error:
+            self.registry.update(run_id, cancel_release_error=_safe_error(error))
+            return None
+        total = pods.get('total') if isinstance(pods, dict) else None
+        data = pods.get('data') if isinstance(pods, dict) else None
+        # A partial page or unknown status cannot establish absence of active pods.
+        if type(total) is not int or total < 0 or not isinstance(data, list) or len(data) != total:
+            return None
+        statuses = [pod.get('podStatus') if isinstance(pod, dict) else None for pod in data]
+        terminal_pods = {'Stopped', 'Deleted', 'Succeeded', 'Failed'}
+        if not all(status in terminal_pods for status in statuses):
+            return None
+        return {'basis': basis, 'task_id': str(record['task_id']), 'pod_total': total,
+                'pod_statuses': statuses, 'active_pods': 0, 'observed_at': utcnow()}
+
+    def _confirm_cancel(self, run_id, evidence, platform=None):
+        record = self._record(run_id)
+        state = ('COMMAND_MISMATCH' if record.get('command_mismatch') else
+                 'RESOURCE_MISMATCH' if record.get('resource_mismatch') else 'CANCELLED')
+        return self.registry.update(run_id, state=state, platform_state=platform or 'Deleted',
+            platform_deleted=True, resource_released=True, release_basis=evidence['basis'],
+            cancel_release_evidence=evidence, cancel_release_error=None,
+            stop_confirmed=True, stop_uncertain=False, requires_stop=False,
+            scientific_outputs_verified=False, last_observed_at=utcnow())
+
     def _observe(self, run_id, row, enforce_resources=False):
         record = self._record(run_id)
         self._owned(row, record, record.get('task_id'))
         platform = row.get('status')
         terminal = platform in PLATFORM_TERMINAL
+        deleted = self._is_deleted(row)
+        if deleted and not terminal:
+            evidence = self._cancel_release_evidence(run_id, row)
+            if evidence is not None:
+                return self._confirm_cancel(run_id, evidence, platform)
         expected_command = (record.get('submitted_request') or {}).get('command')
         returned_command = row.get('command')
         command_mismatch = bool(record.get('command_mismatch') or
@@ -632,6 +685,8 @@ class NativeTasks:
             values['hardware_verified'] = _hardware_receipt_valid(receipt, record['spec'])
             if platform == 'Succeeded' and state not in ('RESOURCE_MISMATCH', 'COMMAND_MISMATCH'):
                 values['state'] = 'SUCCEEDED' if _successful_receipt(receipt, record['spec']) else 'COMPLETED_UNVERIFIED'
+        if deleted and not terminal:
+            values.update(state='STOP_REQUESTED', platform_deleted=True, requires_stop=False)
         updated = self.registry.update(run_id, **values)
         if enforce_resources and updated.get('requires_stop') and not terminal and not updated.get('stop_requested'):
             return self.stop(run_id)
@@ -647,6 +702,9 @@ class NativeTasks:
             raise RuntimeError('Task ID is unknown; use task-reconcile before further action')
         row = self._get_task(record['task_id'])
         if row is None:
+            evidence = self._cancel_release_evidence(run_id)
+            if evidence is not None:
+                return self._confirm_cancel(run_id, evidence)
             return self.registry.update(run_id, visibility_pending=True,
                                         resource_released=bool(record.get('resource_released')))
         return self._observe(run_id, row, enforce_resources=enforce_resources)
@@ -692,6 +750,7 @@ class NativeTasks:
         if timeout <= 0 or interval <= 0:
             raise ValueError('Stop timeout and polling interval must be positive')
         with self.registry.operation(run_id, 'stop'):
+            deadline = time.monotonic() + timeout
             with self.registry.lock(run_id):
                 record = self._record(run_id)
                 if record.get('resource_released') and record['state'] in TERMINAL:
@@ -704,29 +763,107 @@ class NativeTasks:
                         record.update(cancel_requested=True, requires_reconcile=True, resource_released=False)
                     self.registry.write(run_id, record)
                     return record
+                # Intent is independent from whether a previous stop request was
+                # accepted. Legacy stop_requested=True must never suppress a new
+                # explicit stop after a rejected or ambiguous request.
+                record['cancel_requested'] = True
+                self.registry.write(run_id, record)
             row = self._get_task(record['task_id'])
             if row is None:
-                raise RuntimeError('Task is not visible; release is not confirmed')
+                evidence = self._cancel_release_evidence(run_id)
+                if evidence is not None:
+                    return self._confirm_cancel(run_id, evidence)
+                return self.registry.update(run_id, state='STOP_REQUESTED', visibility_pending=True,
+                    stop_confirmed=False, stop_uncertain=True, resource_released=False)
             current = self._observe(run_id, row, enforce_resources=False)
             if current['resource_released']:
-                return current
-            if not current.get('stop_requested'):
-                self.registry.update(run_id, stop_requested=True,
-                                     state='COMMAND_MISMATCH' if current.get('command_mismatch') else
-                                     'RESOURCE_MISMATCH' if current.get('resource_mismatch') else 'STOP_REQUESTED')
+                return self.registry.update(run_id, stop_confirmed=True, stop_uncertain=False,
+                                            requires_stop=False)
+            platform = row.get('status')
+            if self._is_deleted(row):
+                method, path, action, body = None, None, 'cancel_unfinished', None
+            elif platform in ('Pending', 'Queuing', 'ImagePulling', 'DatasetPulling'):
+                method, path, action = 'DELETE', '/api/iresource/v1/train', 'cancel_unfinished'
+                body = {'jobIdList': [str(record['task_id'])], 'endTaskListFlag': False}
+            elif platform == 'Running':
+                method, action = 'POST', 'stop_running'
+                path = '/api/iresource/v1/train/' + str(record['task_id']) + '/stop'
+                body = None
+            elif platform == 'Terminating':
+                method, path, action, body = None, None, 'await_termination', None
+            else:
+                return self.registry.update(run_id, stop_confirmed=False, stop_accepted=False,
+                    stop_uncertain=True, stop_error={'type': 'UnsupportedPlatformState'},
+                    resource_released=False)
+            if method is not None and current.get('stop_accepted') is True and current.get('stop_action') == action:
+                # An acknowledged operation is observed, not sent again. A prior
+                # rejection/transport ambiguity/legacy intent flag can be retried
+                # by a new explicit call after this fresh state query.
+                method = None
+            rejected = False
+            if method is not None:
+                if time.monotonic() >= deadline:
+                    return self.registry.update(run_id, stop_confirmed=False, stop_uncertain=True,
+                                                resource_released=False)
+                attempt = {'action': action, 'method': method, 'path': path,
+                           'platform_state': platform, 'requested_at': utcnow(), 'accepted': None}
+                attempts = list(current.get('stop_attempts') or [])[-19:] + [attempt]
+                self.registry.update(run_id, stop_requested=True, stop_accepted=None,
+                    stop_confirmed=False, stop_rejected=False, stop_action=action, stop_method=method,
+                    stop_platform_state=platform, stop_attempts=attempts, stop_error=None,
+                    stop_owner_verified=True, cancel_ack_task_name=None,
+                    state='COMMAND_MISMATCH' if current.get('command_mismatch') else
+                    'RESOURCE_MISMATCH' if current.get('resource_mismatch') else 'STOP_REQUESTED')
                 try:
-                    self.client.call('POST', '/api/iresource/v1/train/' + str(record['task_id']) + '/stop')
+                    response = self.client.call(method, path, **({'body': body} if body is not None else {}))
                 except Exception as error:
-                    return self.registry.update(run_id, stop_error=_safe_error(error), stop_uncertain=True, resource_released=False)
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                row = self._get_task(record['task_id'])
-                if row is not None:
+                    rejected = (isinstance(error, ApiError) and error.status is None
+                                and error.code not in (None, 'PLATFORM_REJECTED'))
+                    attempt.update(accepted=False if rejected else None, error=_safe_error(error))
+                    self.registry.update(run_id, stop_accepted=False if rejected else None,
+                        stop_requested=False if rejected else True, stop_rejected=rejected,
+                        stop_error=_safe_error(error), stop_attempts=attempts,
+                        stop_uncertain=not rejected, resource_released=False)
+                else:
+                    attempt['accepted'] = True
+                    names = response.get('trainNames') if isinstance(response, dict) else None
+                    expected = record['spec']['task_name']
+                    acknowledged = names == expected or names == [expected]
+                    self.registry.update(run_id, stop_accepted=True, stop_attempts=attempts,
+                        cancel_ack_task_name=expected if action == 'cancel_unfinished' and acknowledged else None,
+                        stop_uncertain=True)
+            else:
+                self.registry.update(run_id, stop_requested=True, stop_action=action,
+                                     stop_confirmed=False, stop_uncertain=True)
+            # Always re-read after a response, even an explicit rejection: the
+            # task may have reached a terminal state while the mutation raced.
+            first_observation = True
+            while first_observation or time.monotonic() < deadline:
+                first_observation = False
+                try:
+                    row = self._get_task(record['task_id'])
+                except Exception as error:
+                    return self.registry.update(run_id, stop_observation_error=_safe_error(error),
+                        stop_confirmed=False, stop_uncertain=True, resource_released=False)
+                if row is None:
+                    evidence = self._cancel_release_evidence(run_id)
+                    if evidence is not None:
+                        return self._confirm_cancel(run_id, evidence)
+                else:
                     current = self._observe(run_id, row, enforce_resources=False)
                     if current['resource_released']:
-                        return self.registry.update(run_id, stop_uncertain=False)
-                time.sleep(min(interval, max(0, deadline - time.monotonic())))
-            return self.registry.update(run_id, stop_uncertain=True, resource_released=False)
+                        return self.registry.update(run_id, stop_confirmed=True, stop_uncertain=False,
+                                                    requires_stop=False)
+                if rejected:
+                    return self.registry.update(run_id, stop_confirmed=False, stop_uncertain=False,
+                                                resource_released=False)
+                # Disappearance after DELETE alone does not prove resource release.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(interval, remaining))
+            return self.registry.update(run_id, stop_confirmed=False, stop_uncertain=True,
+                                        resource_released=False)
 
     cancel = stop
 

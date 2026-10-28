@@ -19,6 +19,8 @@ Account setup uses direct input. Online commands default to hidden password inpu
 
 The verified single-node GPU path passed real V100 CUDA computation, persistent result/receipt readback and checksums. Runtime still checks every allocation. Creation payload must **omit taskType**; copying the returned classification or a direct URL query into the request causes CPU data-processing fallback. The launcher avoids the platform's double-quote/newline rewriting. Default 1000-byte command budget is a client safeguard, not an official universal limit; long inline guard commands must use staged files instead.
 
+`task-stop` routes queued/starting cancellation through the unfinished-task cancel API and Running through stop. It never uses finished-history deletion. A deleted task may still report Pending: require deleteFlag plus a complete no-active-pod view before claiming release. Errors trigger a state reread; rejected stops may be explicitly retried, accepted stops are only observed. An unconfirmed stop returns nonzero; `--timeout` bounds confirmation waiting. Preserve local request/attempt evidence.
+
 Unknown creation outcomes require reconciliation before any new POST. Explicit platform parameter rejection is `REJECTED` and does not imply an allocated GPU. Identical run IDs/specs reuse records; changed code/parameters need new IDs. Observers do not launch replacement work. Do not adopt unscoped legacy state automatically.
 
 ## Development and storage

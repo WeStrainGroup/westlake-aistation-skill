@@ -87,6 +87,18 @@ scripts/wlai task-stop --run-id RUN_ID
 
 A local watch timeout does not cancel the platform task. Native outputs remain on persistent storage; automatic native downloads are not implemented. The platform group's own lifetime still applies, including guard/receipt allowances; verify it rather than assuming five days. Scientific checkpoint/resume is the program's responsibility.
 
+### Cancel queued or running tasks
+
+```bash
+scripts/wlai task-stop --run-id RUN_ID --timeout 120 --interval 2
+```
+
+Pending/Queuing/ImagePulling/DatasetPulling use the official unfinished-task cancellation request (`DELETE /train`, one recorded job ID, `endTaskListFlag=false`). Running uses `POST /train/{id}/stop`. Completed tasks require no mutation; the client never sends finished-history deletion to cancel a job. Ownership, task ID and immutable name are checked first.
+
+The service can retain status Pending after cancellation while setting deleteFlag=true. The client verifies that deletion flag and a complete instance list containing no active pods before confirming release. A disappearing list row alone is insufficient. If the row disappears, an exact acknowledged task name and prior ownership check plus the same pod evidence are required. Local records preserve request and cancellation-attempt evidence.
+
+A rejected stop is reread for a completion race and can be retried with another explicit task-stop. A previously accepted cancellation is observed without another mutation. One call never replays a failed mutation automatically. Confirmation timeout or failure returns exit code 2; confirmed release returns 0 even when the earlier program had failed. The supplied timeout is the observation budget, while an in-flight bounded API read may finish afterwards. No scientific completion is inferred from successful cancellation.
+
 `UNKNOWN` means creation may have happened: reconcile before another creation POST. Mutations use fresh verified TLS connections and are never automatically replayed. An explicit known parameter rejection is `REJECTED`, with no task created; it does not mean a GPU remains occupied. A changed spec needs a new run ID. `COMMAND_MISMATCH` or `RESOURCE_MISMATCH` stops only the newly submitted task; observers merely report remediation requirements.
 
 Platform success without a matching terminal guard receipt is `COMPLETED_UNVERIFIED`. Multiple unbound attempts cannot establish a unique successful execution. Guard success is infrastructure evidence, not scientific validation. Check expected results/checkpoints and their hashes separately. Native `resource_released=true` is based on platform terminal status, not a physical account-wide usage measurement.
