@@ -30,7 +30,8 @@ class IdentityError(ssl.SSLError):
 
 
 class AIStation:
-    def __init__(self, profile, timeout=20, password_provider=None, *, read_attempts=3, retry_budget=30):
+    def __init__(self, profile, timeout=20, password_provider=None, *, read_attempts=3, retry_budget=30,
+                 deadline_provider=None):
         if timeout <= 0 or read_attempts < 1 or retry_budget <= 0:
             raise ValueError("HTTP timeout, attempt count and retry budget must be positive")
         self.profile = profile
@@ -38,6 +39,7 @@ class AIStation:
         self.read_attempts = min(int(read_attempts), 5)
         self.retry_budget = float(retry_budget)
         self.password_provider = password_provider
+        self.deadline_provider = deadline_provider
         self.token = ""
         self.cookies = {}
         self.timings = []
@@ -128,7 +130,11 @@ class AIStation:
         target = path + ("?" + urlencode(params) if params else "")
         payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode() if body is not None else None
         started = time.monotonic()
-        deadline = started + self.retry_budget
+        deadline = started + (self.retry_budget if method == 'GET' else self.timeout)
+        if self.deadline_provider:
+            outer_deadline = self.deadline_provider()
+            if outer_deadline is not None:
+                deadline = min(deadline, outer_deadline)
         attempts = self.read_attempts if method == "GET" else 1
         refreshed = False
         attempt = 0
@@ -138,11 +144,11 @@ class AIStation:
                 while True:
                     attempt += 1
                     remaining = deadline - time.monotonic()
-                    if method == "GET" and remaining <= 0:
-                        raise ApiError("Read retry deadline exhausted; no additional request sent")
-                    timeout = min(self.timeout, remaining) if method == "GET" else self.timeout
+                    if remaining <= 0:
+                        raise ApiError("Request deadline exhausted; no additional request sent")
+                    timeout = min(self.timeout, remaining)
                     try:
-                        request_deadline = deadline if method == "GET" else time.monotonic() + self.timeout
+                        request_deadline = deadline
                         connection = self._connect(timeout)
                         headers = {"Accept": "application/json", "X-Accept-Language": "zh_CN"}
                         if self.token:
@@ -152,8 +158,16 @@ class AIStation:
                         if payload is not None:
                             headers["Content-Type"] = "application/json;charset=UTF-8"
                         headers.update(self.extra_headers)
+                        remaining = request_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError('Request deadline exhausted before sending')
+                        connection.sock.settimeout(min(self.timeout, remaining))
                         connection.request(method, target, body=payload, headers=headers)
                         sock = connection.sock
+                        remaining = request_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError('Request deadline exhausted before response headers')
+                        sock.settimeout(min(self.timeout, remaining))
                         response = connection.getresponse()
                         raw = self._read_body(response, sock, request_deadline)
                         status = response.status

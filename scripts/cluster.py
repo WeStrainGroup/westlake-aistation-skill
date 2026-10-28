@@ -15,6 +15,7 @@ import secrets
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 from Cryptodome.Cipher import AES
@@ -26,6 +27,7 @@ from api import AIStation, ApiError, rows
 from config import load_profile, state_directory
 from credentials import get_password
 from registry import Registry, utcnow, validate_run_id, profile_identity
+from storage import StorageError, verify_mount, PROBE_PROGRAM, parse_probe_output, last_probe_phase
 
 ROOT = Path(__file__).resolve().parent
 TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "BLOCKED", "COLLECTION_FAILED"}
@@ -53,6 +55,7 @@ def prepare_spec(source, profile=None):
     run_id = spec.get("run_id")
     validate_run_id(run_id)
     spec.setdefault("backend", "environment")
+    spec.setdefault("purpose", "development")
     spec.setdefault("cpus", 12)
     spec.setdefault("gpus", 1)
     spec.setdefault("memory_gb", 0)
@@ -63,19 +66,27 @@ def prepare_spec(source, profile=None):
         spec.setdefault("card_type", profile.get("card_type", ""))
     spec.setdefault("max_seconds", 60)
     spec.setdefault("ready_timeout", 150)
+    spec.setdefault("preparation_seconds", 300)
+    spec.setdefault("collection_seconds", 120)
+    spec.setdefault("cleanup_seconds", 60)
     spec.setdefault("uploads", [])
     spec.setdefault("downloads", [])
     for key in ("resource_group_id", "card_type"):
         if key in spec and (not isinstance(spec[key], str) or not spec[key].strip()):
             raise ValueError(f"{key} must be a nonempty string copied from live resource metadata")
     for key, low, high in (("cpus", 1, 500), ("gpus", 0, 25), ("max_seconds", 1, 13800),
-                           ("ready_timeout", 1, 1800), ("memory_gb", 0, 1024)):
+                           ("ready_timeout", 1, 1800), ("preparation_seconds", 1, 3600),
+                           ("collection_seconds", 1, 3600), ("cleanup_seconds", 1, 600),
+                           ("memory_gb", 0, 1024)):
         if type(spec[key]) is not int or not low <= spec[key] <= high:
             raise ValueError(f"{key} must be an integer from {low} to {high}")
-    if spec["max_seconds"] + spec["ready_timeout"] + 60 > min(14400, profile.get("max_environment_seconds", 14400)):
-        raise ValueError("Program, readiness and cleanup allowance must fit the 4-hour development limit")
-    if spec["backend"] != "environment":
-        raise ValueError("Only the verified environment backend is enabled")
+    if spec["ready_timeout"] > spec["preparation_seconds"]:
+        raise ValueError("ready_timeout must fit within preparation_seconds")
+    total = sum(spec[key] for key in ("preparation_seconds", "max_seconds", "collection_seconds", "cleanup_seconds"))
+    if total > min(14400, profile.get("max_environment_seconds", 14400)):
+        raise ValueError("Preparation, program, collection and cleanup must fit the development environment limit")
+    if spec["backend"] != "environment" or spec["purpose"] != "development":
+        raise ValueError("Only development/debugging jobs execute here; use task-guide for formal training")
     if not isinstance(spec.get("argv"), list) or not spec["argv"] or not all(
             isinstance(item, str) and "\x00" not in item for item in spec["argv"]):
         raise ValueError("argv must be a nonempty JSON list of command arguments")
@@ -112,13 +123,24 @@ class Cluster:
         self.interactive = interactive
         self._client = None
         self._user = None
+        self._active_deadline = None
+        self._clock_deadlines = {}
 
     @property
     def client(self):
         if self._client is None:
             provider = lambda: get_password(self.profile, interactive=self.interactive)
-            client = AIStation(self.profile, password_provider=provider)
-            self._user = client.login(self.profile["account"], provider())
+            password = provider()
+            client = AIStation(self.profile, password_provider=provider,
+                               timeout=self._remaining(20), retry_budget=self._remaining(30),
+                               deadline_provider=lambda: self._active_deadline)
+            try:
+                self._user = client.login(self.profile["account"], password)
+            except BaseException:
+                client.close()
+                raise
+            finally:
+                del password
             self._client = client
         return self._client
 
@@ -131,6 +153,82 @@ class Cluster:
         if self._client is not None:
             self._client.close()
 
+    def _ensure_lease(self, run_id, *, allocation=False):
+        record = self.registry.get(run_id)
+        if record.get('lease_deadline_epoch'):
+            return record
+        now = time.time()
+        # Imported records cannot acquire a fresh four-hour lease on recovery.
+        if not allocation and record.get('resource_id'):
+            try:
+                now = datetime.datetime.fromisoformat(record['created_at']).timestamp()
+            except (KeyError, ValueError):
+                raise RuntimeError('Existing allocation has no trustworthy lease origin; reconcile it manually') from None
+        limit = min(14400, self.profile.get('max_environment_seconds', 14400))
+        spec = record['spec']
+        return self.registry.update(run_id, lease_started_epoch=now,
+            lease_deadline_epoch=now + limit,
+            preparation_deadline_epoch=now + spec.get('preparation_seconds', 300))
+
+    def _monotonic_deadline(self, run_id, field):
+        record = self.registry.get(run_id)
+        epoch = record[field]
+        key = (run_id, field, epoch)
+        if key not in self._clock_deadlines:
+            self._clock_deadlines[key] = time.monotonic() + max(0, epoch - time.time())
+        return self._clock_deadlines[key]
+
+    @contextmanager
+    def _phase(self, run_id, phase, timeout=None):
+        record = self._ensure_lease(run_id)
+        lease = self._monotonic_deadline(run_id, 'lease_deadline_epoch')
+        if phase == 'preparation':
+            deadline = min(lease, self._monotonic_deadline(run_id, 'preparation_deadline_epoch'))
+        elif phase == 'collection':
+            if not record.get('collection_deadline_epoch'):
+                seconds = record['spec'].get('collection_seconds', 120)
+                self.registry.update(run_id, collection_deadline_epoch=min(
+                    time.time() + seconds,
+                    record['lease_deadline_epoch'] - record['spec'].get('cleanup_seconds', 60)))
+            deadline = min(lease, self._monotonic_deadline(run_id, 'collection_deadline_epoch'))
+        elif phase == 'cleanup':
+            seconds = record['spec'].get('cleanup_seconds', 60) if timeout is None else timeout
+            # After an expired lease only bounded cleanup/confirmation is allowed,
+            # never another launch or continued compute.
+            deadline = min(lease, time.monotonic() + seconds) if lease > time.monotonic() else time.monotonic() + min(seconds, 30)
+        elif phase == 'diagnostics':
+            deadline = min(lease, time.monotonic() + (30 if timeout is None else timeout))
+        else:
+            raise ValueError('Unknown lifecycle phase')
+        if deadline <= time.monotonic():
+            raise TimeoutError(phase.capitalize() + ' deadline exhausted; no further work started')
+        previous = self._active_deadline
+        self._active_deadline = deadline
+        try:
+            yield deadline
+        finally:
+            self._active_deadline = previous
+
+    def _remaining(self, cap=None):
+        if self._active_deadline is None:
+            return cap
+        remaining = self._active_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Lifecycle phase deadline exhausted')
+        return remaining if cap is None else min(cap, remaining)
+
+    def _call(self, method, path, **kwargs):
+        client = self.client
+        if self._active_deadline is None:
+            return client.call(method, path, **kwargs)
+        timeout = client.timeout if isinstance(client.timeout, (int, float)) else 20
+        budget = client.retry_budget if isinstance(client.retry_budget, (int, float)) else 30
+        client.timeout, client.retry_budget = self._remaining(timeout), self._remaining(budget)
+        try:
+            return client.call(method, path, **kwargs)
+        finally:
+            client.timeout, client.retry_budget = timeout, budget
+
     def _check_cancelled(self, run_id):
         record = self.registry.get(run_id)
         if record.get("cancel_requested"):
@@ -140,7 +238,7 @@ class Cluster:
         result = []
         for page in range(1, 51):
             query = dict(params or {}, page=page, pageSize=100)
-            data = self.client.call("GET", endpoint, params=query)
+            data = self._call("GET", endpoint, params=query)
             batch = rows(data); result.extend(batch)
             total = data.get("total") if isinstance(data, dict) else None
             if not batch or len(batch) < 100 or isinstance(total, int) and len(result) >= total:
@@ -163,7 +261,7 @@ class Cluster:
                 for row in nodes]
 
     def environment(self, environment_id):
-        return self.client.call("GET", f"/api/iresource/v1/work-platform/{environment_id}/detail")
+        return self._call("GET", f"/api/iresource/v1/work-platform/{environment_id}/detail")
 
     def env_payload(self, spec):
         return {"wpType": "COMMON_WP", "jupyterType": 0, "wpName": "wl_" + spec["run_id"],
@@ -175,22 +273,37 @@ class Cluster:
                 "acceleratorCardMemory": 0, "shmSize": 4, "command": "", "switchType": "ib",
                 "models": [], "ports": [], "volumes": [], "nodeList": [], "enUpdateDataSet": 0}
 
-    def plan(self, spec):
+    def plan(self, spec, online=False):
         record = self.registry.reserve(spec["run_id"], spec, "run")
         if record["state"] == "PLANNED":
             for entry in spec["downloads"]:
                 if Path(entry["local"]).exists():
                     raise ValueError(f"Download destination already exists: {entry['local']}")
-        group = spec.get("resource_group_id", self.profile["development_group_id"]) if spec["backend"] == "environment" else self.profile.get("training_group_id")
-        nodes = self.resources(group)
-        eligible = [node["node"] for node in nodes if node["available_cpus"] >= spec["cpus"]
-                    and node["available_gpus"] >= spec["gpus"]
-                    and (not spec["gpus"] or node["card_type"] == spec.get("card_type", self.profile.get("card_type", "")))]
+        eligible = None
+        if online:
+            nodes = self.resources(spec.get("resource_group_id", self.profile["development_group_id"]))
+            eligible = [node["node"] for node in nodes if node["available_cpus"] >= spec["cpus"]
+                        and node["available_gpus"] >= spec["gpus"]
+                        and (not spec["gpus"] or node["card_type"] == spec.get("card_type", self.profile.get("card_type", "")))]
+        upload_bytes = sum(Path(entry['local']).stat().st_size for entry in spec['uploads'])
+        budget = {key: spec[key] for key in ('preparation_seconds','max_seconds','collection_seconds','cleanup_seconds')}
+        total = sum(budget.values())
+        notes = ['Development environment is for debugging/short validation; formal training uses task management.',
+                 'GPU/CPU availability is not account quota approval; group storage quota must be checked separately.',
+                 'CPU-only allocations can still be billed; program GPU-hours exclude environment preparation and collection.',
+                 'Planned GPU-hours are not a billing cap; failed collection or an offline controller can leave resources held until confirmed release or the platform lifetime cap.']
+        if upload_bytes >= 1024 ** 3:
+            notes.append('Large inputs should be staged before GPU allocation; container SFTP has the development time limit, not the browser 1 GB upload rule.')
         return {"run_id": spec["run_id"], "state": record["state"], "spec_sha256": record["spec_sha256"],
-                "spec": spec, "eligible_nodes_now": eligible,
-                "resource_request": self.env_payload(spec) if spec["backend"] == "environment" else None,
+                "spec": spec, "availability_checked": bool(online), "eligible_nodes_now": eligible,
+                "resource_request": self.env_payload(spec), "command": spec['argv'],
+                "upload_total_bytes": upload_bytes, "time_budget": dict(budget, total_seconds=total,
+                    environment_limit_seconds=min(14400,self.profile.get('max_environment_seconds',14400))),
+                "storage": self.profile.get('storage','custom'), "persistent_root": self.profile['persistent_root'],
                 "program_gpu_hours_budget": round(spec["gpus"] * spec["max_seconds"] / 3600, 4),
-                "submitted": bool(record.get("resource_id"))}
+                "environment_gpu_hours_budget": round(spec['gpus'] * total / 3600, 4),
+                "platform_lifetime_gpu_hours": round(spec['gpus'] * 14400 / 3600, 4),
+                "manual_notes": notes, "submitted": bool(record.get("resource_id"))}
 
     def create_environment(self, run_id):
         # The lock spans the request so two agents cannot both submit this run_id.
@@ -201,10 +314,15 @@ class Cluster:
                 return record
             if record["state"] != "PLANNED":
                 raise RuntimeError("Creation outcome needs reconcile; never resubmit an ambiguous POST")
+            live = self.plan(record['spec'], online=True)
+            if not live['eligible_nodes_now']:
+                raise RuntimeError('No node currently meets the requested CPU/GPU resources')
+            self._ensure_lease(run_id, allocation=True)
             record = self.registry.update(run_id, state="SUBMITTING", resource_type="work-platform")
             try:
-                created = self.client.call("POST", "/api/iresource/v1/work-platform/",
-                                           body=self.env_payload(record["spec"]))
+                with self._phase(run_id, 'preparation'):
+                    created = self._call("POST", "/api/iresource/v1/work-platform/",
+                                         body=self.env_payload(record["spec"]))
             except BaseException:
                 self.registry.update(run_id, state="UNKNOWN", uncertain_action="allocation")
                 raise
@@ -224,8 +342,12 @@ class Cluster:
                 return current
 
     def wait_environment(self, run_id):
+        with self._phase(run_id, 'preparation'):
+            return self._wait_environment(run_id)
+
+    def _wait_environment(self, run_id):
         record = self.registry.get(run_id); spec = record["spec"]
-        deadline = time.monotonic() + spec["ready_timeout"]
+        deadline = min(time.monotonic() + spec["ready_timeout"], self._active_deadline)
         previous = None
         while time.monotonic() < deadline:
             self._check_cancelled(run_id)
@@ -276,11 +398,11 @@ class Cluster:
         return names
 
     def ssh_credentials(self, environment_id):
-        public = self.client.call("GET", "/api/ibase/v1/system/secret")
+        public = self._call("GET", "/api/ibase/v1/system/secret")
         public = public[2:] if len(public) == 130 else public
         key = secrets.token_hex(8).encode()
         encrypted = "04" + CryptSM2(public_key=public, private_key="", mode=0).encrypt(key).hex()
-        data = self.client.call("GET", f"/api/iresource/v1/work-platform/{environment_id}/pod/default/shell",
+        data = self._call("GET", f"/api/iresource/v1/work-platform/{environment_id}/pod/default/shell",
                                 params={"k": encrypted})
         password = unpad(AES.new(key, AES.MODE_CBC, b"87EEA6BC8A6383B3").decrypt(
             bytes.fromhex(data["password"])), 16).decode()
@@ -295,6 +417,22 @@ class Cluster:
 
     @contextmanager
     def ssh(self, environment_id):
+        previous = self._active_deadline
+        try:
+            if previous is None:
+                managed = [record for record in self.registry.list() if record.get('resource_id') == environment_id]
+                if managed:
+                    run_id = managed[0]['run_id']
+                    self._ensure_lease(run_id)
+                    self._active_deadline = self._monotonic_deadline(run_id, 'lease_deadline_epoch')
+                    self._remaining()
+            with self._ssh(environment_id) as client:
+                yield client
+        finally:
+            self._active_deadline = previous
+
+    @contextmanager
+    def _ssh(self, environment_id):
         detail = self.environment(environment_id)
         if detail.get('userId') != self.user['userId']:
             raise RuntimeError('Refusing SSH access to another account environment')
@@ -311,35 +449,46 @@ class Cluster:
         host, port, user, password = self.ssh_credentials(environment_id)
         client = paramiko.SSHClient(); client.set_missing_host_key_policy(PinnedHost())
         try:
+            connection_timeout = max(0.1, self._remaining(15))
             client.connect(host, port=port, username=user, password=password,
-                           look_for_keys=False, allow_agent=False, timeout=15,
-                           auth_timeout=15, banner_timeout=15, channel_timeout=30)
+                           look_for_keys=False, allow_agent=False, timeout=connection_timeout,
+                           auth_timeout=connection_timeout, banner_timeout=connection_timeout,
+                           channel_timeout=max(0.1, self._remaining(30)))
             del password
             client.get_transport().set_keepalive(30)
             yield client
         finally:
             client.close()
 
-    @staticmethod
-    def _open_sftp(client, timeout=30):
-        sftp = client.open_sftp()
+    def _open_sftp(self, client, timeout=30):
+        timeout = max(0.1, self._remaining(timeout))
+        # SFTP negotiation itself precedes get_channel().settimeout(). Bound
+        # that negotiation too, rather than only subsequent file reads/writes.
+        guard = threading.Timer(timeout, client.close)
+        guard.daemon = True
+        guard.start()
+        try:
+            sftp = client.open_sftp()
+        finally:
+            guard.cancel()
         sftp.get_channel().settimeout(timeout)
         return sftp
 
-    @staticmethod
-    def execute(client, argv, max_seconds=60):
-        command = shlex.join(["timeout", "--kill-after=5", str(max_seconds), *argv])
-        _, stdout, _ = client.exec_command(command, timeout=max_seconds + 15)
+    def execute(self, client, argv, max_seconds=60):
+        allowed = self._remaining(max_seconds + 15)
+        remote_limit = max(0.1, min(max_seconds, allowed - 5))
+        command = shlex.join(["timeout", "--kill-after=5", str(remote_limit), *argv])
+        _, stdout, _ = client.exec_command(command, timeout=allowed)
         channel = stdout.channel; out = bytearray(); err = bytearray()
-        deadline = time.monotonic() + max_seconds + 15
+        deadline = time.monotonic() + allowed
         while True:
             if channel.recv_ready(): out.extend(channel.recv(65536))
             if channel.recv_stderr_ready(): err.extend(channel.recv_stderr(65536))
+            if time.monotonic() > deadline:
+                channel.close(); raise RemoteExecutionTimeout(out,err)
             if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                 return {"exit_code": channel.recv_exit_status(), "stdout": out.decode(errors="replace"),
                         "stderr": err.decode(errors="replace")}
-            if time.monotonic() > deadline:
-                channel.close(); raise RemoteExecutionTimeout(out,err)
             time.sleep(0.05)
 
     def _publish_upload(self, client, remote, write, expected_hash=None):
@@ -350,7 +499,7 @@ class Cluster:
         try:
             with sftp.open(temporary, 'wx') as target:
                 target.set_pipelined(True)
-                write(target, digest)
+                write(target, digest, sftp)
             value = digest.hexdigest()
             if expected_hash is not None and value != expected_hash:
                 raise ValueError('Upload source changed after planning')
@@ -362,12 +511,16 @@ class Cluster:
                 raise FileExistsError('Remote destination exists or exclusive publication failed')
             return value
         finally:
-            try: sftp.remove(temporary)
-            except OSError: pass
+            try:
+                sftp.get_channel().settimeout(max(0.1, self._remaining(30)))
+                sftp.remove(temporary)
+            except (OSError, TimeoutError):
+                pass
             sftp.close()
 
     def put_bytes(self, client, remote, data):
-        def write(target, digest):
+        def write(target, digest, sftp):
+            sftp.get_channel().settimeout(max(0.1, self._remaining(30)))
             target.write(data); digest.update(data)
         return self._publish_upload(client, remote, write)
 
@@ -375,10 +528,11 @@ class Cluster:
         local = Path(local)
         if expected_hash is not None and sha256(local) != expected_hash:
             raise ValueError('Upload source changed after planning')
-        def write(target, digest):
+        def write(target, digest, sftp):
             with local.open('rb') as source:
                 for block in iter(lambda: source.read(1024 * 1024), b''):
-                    target.write(block); digest.update(block)
+                    sftp.get_channel().settimeout(max(0.1, self._remaining(30)))
+                    target.write(block); self._remaining(); digest.update(block)
         digest = self._publish_upload(client, remote, write, expected_hash)
         return {'local':str(local), 'remote':remote, 'sha256':digest}
 
@@ -398,7 +552,12 @@ class Cluster:
                 raise FileExistsError(str(local))
             digest = hashlib.sha256()
             with temporary.open('xb') as target, sftp.open(remote, 'rb') as source:
-                for block in iter(lambda: source.read(1024 * 1024), b''):
+                while True:
+                    sftp.get_channel().settimeout(max(0.1, self._remaining(30)))
+                    block = source.read(1024 * 1024)
+                    self._remaining()
+                    if not block:
+                        break
                     target.write(block); digest.update(block)
                 target.flush(); os.fsync(target.fileno())
             value = digest.hexdigest()
@@ -413,6 +572,78 @@ class Cluster:
             temporary.unlink(missing_ok=True)
 
     def launch(self, run_id):
+        with self._phase(run_id, 'preparation'):
+            return self._launch(run_id)
+
+    def storage_check(self, run_id, write_probe=True):
+        """Inspect only an already allocated environment; never allocate or switch storage."""
+        record = self.registry.get(run_id)
+        if not record.get('resource_id') or record.get('resource_released'):
+            raise StorageError('Storage check requires an existing running environment')
+        if self._active_deadline is not None:
+            with self.ssh(record['resource_id']) as client:
+                return self._storage_check(run_id, client, write_probe)
+        with self._phase(run_id, 'diagnostics', timeout=30):
+            with self.ssh(record['resource_id']) as client:
+                return self._storage_check(run_id, client, write_probe)
+
+    def _storage_check(self, run_id, client, write_probe=True):
+        record = self.registry.get(run_id)
+        mount = self.profile.get('storage_mount') or posixpath.dirname(self.profile['persistent_root'])
+        try:
+            result = self.execute(client, ['cat', '/proc/self/mountinfo'], 10)
+        except RemoteExecutionTimeout:
+            self.registry.update(run_id, storage_check={'completed': False, 'last_stage': 'mount',
+                                                        'error': 'TimeoutError'})
+            raise StorageError('Mount inspection timed out; compute was not started') from None
+        if result['exit_code']:
+            raise StorageError('Cannot inspect mount evidence; no directory was created')
+        try:
+            evidence = verify_mount(result['stdout'], mount, record['spec']['run_dir'])
+        except StorageError as error:
+            self.registry.update(run_id, storage_check={'completed': False, 'last_stage': 'mount',
+                                                        'error': str(error)})
+            raise
+        try:
+            probe = self.execute(client, [
+                self.profile.get('remote_python', '/opt/conda/bin/python'), '-S', '-u', '-c',
+                PROBE_PROGRAM, record['spec']['run_dir'], '1' if write_probe else '0', mount], 30)
+        except RemoteExecutionTimeout as error:
+            phase = last_probe_phase(error.stdout)
+            self.registry.update(run_id, storage_check={'mount': evidence, 'completed': False,
+                                                        'last_stage': phase, 'error': 'TimeoutError'})
+            raise StorageError('Personal storage check timed out at ' + phase + '; compute was not started') from None
+        if probe['exit_code'] in (124, 137):
+            phase = last_probe_phase(probe['stdout'])
+            self.registry.update(run_id, storage_check={'mount': evidence, 'completed': False,
+                                                        'last_stage': phase, 'error': 'TimeoutError'})
+            raise StorageError('Personal storage check timed out at ' + phase + '; compute was not started')
+        if probe['exit_code']:
+            self.registry.update(run_id, storage_check={'mount': evidence, 'completed': False,
+                'last_stage': last_probe_phase(probe['stdout']), 'error': 'ProbeFailed'})
+            raise StorageError('Personal storage is not writable/readable; check mount, quota and permissions') from None
+        checked = parse_probe_output(probe['stdout'])
+        upload_bytes = sum(Path(entry['local']).stat().st_size for entry in record['spec']['uploads'])
+        if checked['available_bytes'] < upload_bytes:
+            raise StorageError('Filesystem free space is below planned uploads; group quota must also be checked')
+        checked.update(mount=evidence, completed=True, storage=self.profile.get('storage', 'custom'),
+                       group_quota_verified=False)
+        self.registry.update(run_id, storage_check=checked)
+        return checked
+
+    def _check_program_budget(self, run_id):
+        record = self.registry.get(run_id)
+        spec = record['spec']
+        grace = min(30, spec.get('preparation_seconds', 300) / 4)
+        if self._remaining() < grace:
+            raise TimeoutError('Preparation budget has no runner startup allowance left')
+        lease_left = self._monotonic_deadline(run_id, 'lease_deadline_epoch') - time.monotonic()
+        required = spec['max_seconds'] + spec.get('collection_seconds', 120) + spec.get('cleanup_seconds', 60) + grace
+        if lease_left < required:
+            raise TimeoutError('Environment lease cannot fit the original program, collection and cleanup; program was not started')
+        return grace
+
+    def _launch(self, run_id):
         record = self.registry.get(run_id); spec = record['spec']; root = spec['run_dir']
         self._check_cancelled(run_id)
         if record.get('launch_attempted'):
@@ -426,24 +657,26 @@ class Cluster:
             if sha256(entry['local']) != entry['sha256']:
                 raise ValueError('Upload source changed after planning')
         with self.ssh(record['resource_id']) as client:
-            result = self.execute(client, ['mkdir', '-p', root])
-            if result['exit_code']: raise RuntimeError('Cannot create persistent run directory')
+            self._storage_check(run_id, client, write_probe=True)
             for entry in spec['uploads']:
                 self._check_cancelled(run_id)
                 parent = str(PurePosixPath(entry['remote']).parent)
-                result = self.execute(client, ['mkdir', '-p', parent])
-                if result['exit_code']: raise RuntimeError('Cannot create upload directory')
+                if parent != root:
+                    result = self.execute(client, ['mkdir', '-p', parent])
+                    if result['exit_code']: raise RuntimeError('Cannot create upload directory')
                 self.put(client, entry['local'], entry['remote'], entry['sha256'])
             self.put_bytes(client, root + '/job.json', json.dumps({
                 'argv':spec['argv'], 'max_seconds':spec['max_seconds']}).encode())
             self.put_bytes(client, root + '/runner.py', (ROOT / 'remote_runner.py').read_bytes())
             self._check_cancelled(run_id)
+            grace = self._check_program_budget(run_id)
             # Persist intention before execution. Any interruption after this point requires reconciliation.
-            self.registry.update(run_id, launch_attempted=True, launch_requested_at=utcnow())
+            self.registry.update(run_id, launch_attempted=True, launch_requested_at=utcnow(),
+                                 monitor_deadline_epoch=time.time()+spec['max_seconds']+grace)
             command = ('nohup ' + shlex.join([self.profile.get('remote_python', '/opt/conda/bin/python'), root + '/runner.py', root]) +
                        ' > ' + shlex.quote(root + '/launcher.log') + ' 2>&1 < /dev/null & echo $!')
             try:
-                _, out, err = client.exec_command(command, timeout=15)
+                _, out, err = client.exec_command(command, timeout=max(0.1, self._remaining(15)))
                 pid = out.read().decode().strip()
                 # Consume stderr but never include arbitrary remote contents in an exception.
                 err.read()
@@ -476,7 +709,16 @@ class Cluster:
         finally:
             if own_sftp: sftp.close()
 
-    def stop_environment(self, run_id, timeout=60):
+    def stop_environment(self, run_id, timeout=None):
+        record = self.registry.get(run_id)
+        if not record.get('resource_id') or record.get('resource_released'):
+            return record
+        self.registry.update(run_id, resource_released=False)
+        requested = record['spec'].get('cleanup_seconds',60) if timeout is None else timeout
+        with self._phase(run_id, 'cleanup', timeout=requested):
+            return self._stop_environment(run_id, requested)
+
+    def _stop_environment(self, run_id, timeout):
         with self.registry.operation(run_id, 'stop'):
             record = self.registry.get(run_id)
             if not record.get('resource_id') or record.get('resource_released'):
@@ -487,7 +729,7 @@ class Cluster:
                 raise RuntimeError('Refusing to stop an environment owned by another account')
             released = ('Pause', 'Halt', 'Failed')
             current = detail.get('wpStatus')
-            deadline = time.monotonic() + timeout
+            deadline = min(time.monotonic() + timeout, self._active_deadline)
             pause_sent = False
             if current not in released:
                 self.registry.update(run_id,stop_requested=True,resource_released=False)
@@ -496,7 +738,7 @@ class Cluster:
                 # Wait within the same deadline, never DELETE or launch user code.
                 if current == 'Running' and not pause_sent:
                     try:
-                        self.client.call('PUT', '/api/iresource/v1/work-platform/pause/' + resource_id)
+                        self._call('PUT', '/api/iresource/v1/work-platform/pause/' + resource_id)
                     except BaseException:
                         self.registry.update(run_id,stop_uncertain=True)
                         raise
@@ -536,6 +778,20 @@ class Cluster:
             return result
 
     def finish(self, run_id):
+        record = self.registry.get(run_id)
+        if record.get('collection_complete'):
+            return record
+        try:
+            with self._phase(run_id, 'collection'):
+                return self._finish(run_id)
+        except BaseException as error:
+            compute = record.get('compute_state', record.get('result', {}).get('state'))
+            if compute in ('SUCCEEDED', 'FAILED', 'TIMED_OUT', 'CANCELLED'):
+                self.registry.update(run_id, state='COLLECTION_FAILED', collection_complete=False,
+                                     collection_error=type(error).__name__)
+            raise
+
+    def _finish(self, run_id):
         with self.registry.operation(run_id, 'collection'):
             record = self.registry.get(run_id); spec = record['spec']
             if record.get('collection_complete'): return record
@@ -577,6 +833,12 @@ class Cluster:
                 compute = record.get('compute_state', record.get('result',{}).get('state'))
             if compute not in TERMINAL:
                 raise RuntimeError('Computation is still running or unconfirmed; collect only after it finishes')
+            # An explicit recovery request may receive one fresh collection window,
+            # but cannot renew the environment lease or consume its cleanup reserve.
+            lease = self._ensure_lease(run_id)
+            self.registry.update(run_id, collection_deadline_epoch=min(
+                time.time() + record['spec'].get('collection_seconds',120),
+                lease['lease_deadline_epoch'] - record['spec'].get('cleanup_seconds',60)))
             record = self.finish(run_id)
             if record.get('result',{}).get('state') in TERMINAL or record.get('compute_state') in TERMINAL:
                 return self.stop_environment(run_id)
@@ -586,14 +848,23 @@ class Cluster:
         if interval < 1: raise ValueError('Monitoring interval must be at least one second')
         record = self.registry.get(run_id); spec = record['spec']
         # Persisted local deadline prevents reconnect/recovery from extending the resource lease.
+        self._ensure_lease(run_id)
         if record.get('monitor_deadline_epoch'):
-            remaining = record['monitor_deadline_epoch'] - time.time()
+            deadline = self._monotonic_deadline(run_id, 'monitor_deadline_epoch')
         else:
             remaining = spec['max_seconds'] + 60
             if collect:
                 self.registry.update(run_id, monitor_deadline_epoch=time.time()+remaining)
-        deadline = time.monotonic() + max(0, remaining)
+                deadline = self._monotonic_deadline(run_id, 'monitor_deadline_epoch')
+            else:
+                deadline = time.monotonic() + remaining
+        lease_deadline = self._monotonic_deadline(run_id, 'lease_deadline_epoch')
+        if collect:
+            lease_deadline -= spec.get('collection_seconds', 120) + spec.get('cleanup_seconds', 60)
+        deadline = min(deadline, lease_deadline)
         attempt = 0
+        previous = self._active_deadline
+        self._active_deadline = deadline
         try:
             while time.monotonic() < deadline:
                 try:
@@ -620,6 +891,7 @@ class Cluster:
                     time.sleep(min(delay, max(0,deadline-time.monotonic())))
             raise TimeoutError('Monitoring deadline exceeded')
         finally:
+            self._active_deadline = previous
             if cleanup and self.registry.get(run_id)['state'] != 'COLLECTION_FAILED':
                 self.stop_environment(run_id)
 
@@ -678,10 +950,6 @@ class Cluster:
         run_id = spec['run_id']
         self._check_cancelled(run_id)
         if spec['backend'] != 'environment': raise RuntimeError('Native GPU training backend remains disabled')
-        record = self.registry.get(run_id)
-        if not record.get('resource_id'):
-            plan = self.plan(spec)
-            if not plan['eligible_nodes_now']: raise RuntimeError('No node currently meets the requested CPU/GPU resources')
         try:
             record = self.create_environment(run_id)
             self.wait_environment(run_id)
@@ -708,7 +976,8 @@ class Cluster:
             raise
         finally:
             current = self.registry.get(run_id)
-            if current.get('resource_id') and current['state'] not in ('UNKNOWN','COLLECTION_FAILED'):
+            cleanup_due = current.get('lease_deadline_epoch', float('inf')) - time.time() <= spec.get('cleanup_seconds', 60)
+            if current.get('resource_id') and (current['state'] not in ('UNKNOWN','COLLECTION_FAILED') or cleanup_due):
                 try: self.stop_environment(run_id)
                 except Exception as error:
                     self.registry.update(run_id,cleanup_error=type(error).__name__,resource_released=False)

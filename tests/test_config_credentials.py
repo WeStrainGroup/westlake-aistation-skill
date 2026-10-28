@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from config import ConfigurationError, default_profile_path, load_profile, state_directory, validate_profile
+from config import ConfigurationError, default_profile_path, execution_requirements, load_profile, state_directory, validate_profile, write_profile
 from credentials import CredentialError, _service, _system_keyring, get_password, password_available, store_password
 
 
@@ -66,6 +66,40 @@ class ProfileTests(unittest.TestCase):
     def test_existing_ca_required(self):
         with self.assertRaises(ConfigurationError):
             validate_profile(dict(self.source, ca_file="missing.pem"), self.root)
+    def test_connection_only_profile_can_discover_before_execution_setup(self):
+        source = {key: self.source[key] for key in ('portal', 'account', 'ca_file', 'certificate_sha256')}
+        profile = validate_profile(source, self.root, require_execution=False)
+        self.assertEqual(profile['storage'], 'master')
+        self.assertEqual(profile['storage_mount'], '/example-user')
+        self.assertEqual(profile['persistent_root'], '/example-user/wlai_runs')
+        self.assertIn('development_group_id', execution_requirements(profile))
+        with self.assertRaises(ConfigurationError):
+            validate_profile(source, self.root, require_execution=True)
+    def test_storage_choice_derives_personal_root_without_switching_existing_profile(self):
+        source = dict(self.source)
+        source.pop('persistent_root')
+        ssd = validate_profile(dict(source, storage='ssdwork'), self.root)
+        self.assertEqual(ssd['storage_mount'], '/ssdwork/example-user')
+        self.assertEqual(ssd['persistent_root'], '/ssdwork/example-user/wlai_runs')
+        master = validate_profile(self.source, self.root)
+        self.assertEqual(master['storage'], 'master')
+        self.assertEqual(master['persistent_root'], self.source['persistent_root'])
+    def test_ephemeral_or_unverified_custom_paths_cannot_claim_persistence(self):
+        for changes in ({'persistent_root': '/tmp/compute'}, {'persistent_root': '/root/compute'},
+                        {'storage': 'ssdwork', 'persistent_root': '/example-user/compute'},
+                        {'storage': 'custom', 'storage_mount': '/project', 'persistent_root': '/other/compute'}):
+            with self.subTest(changes=changes), self.assertRaises(ConfigurationError):
+                validate_profile(dict(self.source, **changes), self.root)
+        valid = validate_profile(dict(self.source, storage='custom', storage_mount='/project',
+                                      persistent_root='/project/compute'), self.root)
+        self.assertEqual(valid['storage_mount'], '/project')
+    def test_private_profile_writer_does_not_follow_dangling_output_symlink(self):
+        target = self.root / 'profile.json'
+        outside = self.root / 'unintended.json'
+        target.symlink_to(outside)
+        with self.assertRaises(FileExistsError):
+            write_profile(target, self.source)
+        self.assertFalse(outside.exists())
 
 
 class CredentialTests(unittest.TestCase):

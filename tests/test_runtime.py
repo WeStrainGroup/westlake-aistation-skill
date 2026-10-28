@@ -39,6 +39,8 @@ class RuntimeTests(unittest.TestCase):
     def fake_client(self):
         self.cluster._client=Mock()
         self.cluster._user={'userId':'example-owner'}
+        self.cluster.resources=Mock(return_value=[{'node':'example-node','available_cpus':500,
+                                                   'available_gpus':25,'card_type':'Example GPU'}])
         return self.cluster._client
 
     def allocated(self,**values):
@@ -227,6 +229,7 @@ class RuntimeTests(unittest.TestCase):
             def close(self):pass
         class Client:
             def open_sftp(self):return SFTP()
+            def close(self):pass
         @contextlib.contextmanager
         def ssh(_):connections.append(1);yield Client()
         self.cluster.ssh=ssh
@@ -354,6 +357,186 @@ class RuntimeTests(unittest.TestCase):
         del self.cluster.finish
         with self.assertRaises(RuntimeError):self.cluster.finish('example')
         self.assertFalse(self.cluster.registry.get('example').get('collection_complete',False))
+
+    def test_plan_is_offline_and_reports_whole_lifecycle_budget_and_upload_bytes(self):
+        script = self.root/'input.py'; script.write_text('print(1)\n')
+        spec = prepare_spec({'run_id':'offline','argv':['/bin/true'],'gpus':0,
+                             'uploads':[{'local':str(script),'remote':'{run_dir}/input.py'}]},profile())
+        self.cluster.resources=Mock(side_effect=AssertionError('offline plan contacted platform'))
+        with patch('cluster.get_password',side_effect=AssertionError('offline plan authenticated')):
+            plan=self.cluster.plan(spec)
+        self.assertFalse(plan['availability_checked'])
+        self.assertIsNone(plan['eligible_nodes_now'])
+        self.assertEqual(plan['upload_total_bytes'],script.stat().st_size)
+        self.assertEqual(plan['time_budget']['total_seconds'],540)
+        self.cluster.resources.assert_not_called()
+
+    def test_allocation_refuses_without_live_eligible_node(self):
+        client=self.fake_client()
+        self.cluster.resources.return_value=[]
+        with self.assertRaisesRegex(RuntimeError,'No node'):
+            self.cluster.create_environment('example')
+        self.cluster.resources.assert_called_once()
+        client.call.assert_not_called()
+        self.assertEqual(self.cluster.registry.get('example')['state'],'PLANNED')
+
+    def test_training_and_overbudget_jobs_are_rejected_without_execution(self):
+        with self.assertRaisesRegex(ValueError,'task-guide'):
+            prepare_spec({'run_id':'training','argv':['/bin/true'],'purpose':'training'},profile())
+        with self.assertRaisesRegex(ValueError,'Preparation'):
+            prepare_spec({'run_id':'too_long','argv':['/bin/true'],'max_seconds':13800,
+                          'preparation_seconds':1000},profile())
+        with self.assertRaisesRegex(ValueError,'ready_timeout'):
+            prepare_spec({'run_id':'ready','argv':['/bin/true'],'preparation_seconds':10},profile())
+
+    def test_recovery_cannot_renew_lease_or_preparation_deadline(self):
+        self.allocated()
+        self.cluster.registry.update('example',lease_started_epoch=1000,
+                                     lease_deadline_epoch=2000,preparation_deadline_epoch=1200)
+        with patch('cluster.time.time',return_value=1100),patch('cluster.time.monotonic',return_value=10):
+            self.assertEqual(self.cluster._monotonic_deadline('example','lease_deadline_epoch'),910)
+        with patch('cluster.time.time',return_value=900),patch('cluster.time.monotonic',return_value=20):
+            self.assertEqual(self.cluster._monotonic_deadline('example','lease_deadline_epoch'),910)
+            self.assertEqual(self.cluster._ensure_lease('example')['lease_deadline_epoch'],2000)
+        with patch('cluster.time.time',return_value=1300),patch('cluster.time.monotonic',return_value=30):
+            with self.assertRaisesRegex(TimeoutError,'Preparation'):
+                self.cluster.launch('example')
+
+    def test_program_is_not_silently_shortened_to_remaining_lease(self):
+        self.allocated()
+        now=time.time()
+        self.cluster.registry.update('example',lease_deadline_epoch=now+100,
+                                     preparation_deadline_epoch=now+90)
+        with self.cluster._phase('example','preparation'):
+            with self.assertRaisesRegex(TimeoutError,'original program'):
+                self.cluster._check_program_budget('example')
+        self.assertEqual(self.cluster.registry.get('example')['spec']['max_seconds'],60)
+
+    def test_storage_rejects_unmounted_path_before_any_write(self):
+        self.allocated()
+        client=object()
+        self.cluster.execute=Mock(return_value={'exit_code':0,'stdout':'1 0 0:1 / / rw - overlay overlay rw\n','stderr':''})
+        with self.assertRaisesRegex(RuntimeError,'No independent mount'):
+            self.cluster._storage_check('example',client)
+        self.cluster.execute.assert_called_once_with(client,['cat','/proc/self/mountinfo'],10)
+
+    def test_storage_timeout_reports_stage_and_does_not_start_compute(self):
+        self.allocated()
+        mounted='1 0 0:1 / / rw - overlay overlay rw\n2 1 0:2 / /data rw - fuse.storage storage rw\n'
+        self.cluster.execute=Mock(side_effect=[{'exit_code':0,'stdout':mounted,'stderr':''},
+            RemoteExecutionTimeout(b'{"phase":"mkdir"}\n',b'')])
+        with self.assertRaisesRegex(RuntimeError,'timed out at mkdir'):
+            self.cluster._storage_check('example',object())
+        receipt=self.cluster.registry.get('example')['storage_check']
+        self.assertFalse(receipt['completed'])
+        self.assertEqual(receipt['last_stage'],'mkdir')
+        self.assertNotIn('launch_attempted',self.cluster.registry.get('example'))
+
+    def test_collection_deadline_failure_preserves_successful_compute_state(self):
+        self.allocated(compute_state='SUCCEEDED',result={'state':'SUCCEEDED'})
+        self.cluster.registry.update('example',lease_deadline_epoch=time.time()-1,
+                                     preparation_deadline_epoch=time.time()-1)
+        self.cluster.ssh=Mock(side_effect=AssertionError('expired collection attempted I/O'))
+        with self.assertRaises(TimeoutError):
+            self.cluster.finish('example')
+        receipt=self.cluster.registry.get('example')
+        self.assertEqual(receipt['state'],'COLLECTION_FAILED')
+        self.assertEqual(receipt['compute_state'],'SUCCEEDED')
+        self.cluster.ssh.assert_not_called()
+
+    def test_explicit_collect_receives_new_window_without_renewing_lease(self):
+        self.allocated(compute_state='SUCCEEDED',result={'state':'SUCCEEDED'})
+        now=time.time()
+        lease=now+600
+        self.cluster.registry.update('example',state='COLLECTION_FAILED',
+            lease_deadline_epoch=lease,preparation_deadline_epoch=now-100,collection_deadline_epoch=now-1)
+        @contextlib.contextmanager
+        def ssh(_):yield object()
+        self.cluster.ssh=ssh
+        self.cluster.get=Mock(return_value={'sha256':'example'})
+        self.cluster.stop_environment=Mock(side_effect=lambda rid:self.cluster.registry.update(rid,resource_released=True))
+        result=self.cluster.collect('example')
+        self.assertEqual(result['state'],'SUCCEEDED')
+        self.assertTrue(result['collection_complete'])
+        self.assertEqual(result['lease_deadline_epoch'],lease)
+        self.assertLessEqual(result['collection_deadline_epoch'],time.time()+120)
+        self.assertGreater(result['collection_deadline_epoch'],now)
+
+    def test_expired_lease_still_allows_bounded_stop_confirmation(self):
+        self.allocated()
+        self.fake_client()
+        self.cluster.registry.update('example',lease_deadline_epoch=time.time()-100)
+        self.cluster.environment=Mock(return_value={'userId':'example-owner','wpStatus':'Pause'})
+        result=self.cluster.stop_environment('example')
+        self.assertTrue(result['resource_released'])
+        self.assertEqual(result['final_resource_state'],'Pause')
+
+    def test_transfer_reads_refresh_timeout_against_phase_deadline(self):
+        clock={'now':0};timeouts=[];reads=[]
+        class Channel:
+            def settimeout(self,value):timeouts.append(value)
+        channel=Channel()
+        class Remote:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def read(self,_):
+                reads.append(clock['now'])
+                if len(reads)<=2:
+                    clock['now']+=2
+                    return b'a'
+                return b''
+        class SFTP:
+            def get_channel(self):return channel
+            def open(self,*args):return Remote()
+            def close(self):pass
+        client=Mock();client.open_sftp.return_value=SFTP()
+        expected=hashlib.sha256(b'aa').hexdigest()
+        self.cluster.execute=Mock(return_value={'exit_code':0,'stdout':expected+' file\n','stderr':''})
+        self.cluster._active_deadline=5
+        with patch('cluster.time.monotonic',side_effect=lambda:clock['now']):
+            self.cluster.get(client,'/remote/output',self.root/'download')
+        self.assertEqual((self.root/'download').read_bytes(),b'aa')
+        self.assertEqual(timeouts,[5,5,3,1])
+
+    def test_sftp_negotiation_is_bounded_before_channel_is_available(self):
+        closed=threading.Event()
+        class Client:
+            def close(self):closed.set()
+            def open_sftp(self):
+                if not closed.wait(2):
+                    raise AssertionError('SFTP negotiation was left unbounded')
+                raise EOFError('simulated interrupted negotiation')
+        self.cluster._active_deadline=time.monotonic()+0.1
+        started=time.monotonic()
+        with self.assertRaises(EOFError):
+            self.cluster._open_sftp(Client())
+        self.assertLess(time.monotonic()-started,1)
+        self.assertTrue(closed.is_set())
+
+    def test_upload_stops_on_phase_deadline_without_publishing_partial_data(self):
+        clock={'now':0};timeouts=[]
+        source=self.root/'large-input'
+        source.write_bytes(b'x'*(2*1024*1024))
+        class Channel:
+            def settimeout(self,value):timeouts.append(value)
+        class Target:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def set_pipelined(self,_):pass
+            def write(self,_):clock['now']+=2
+        sftp=Mock()
+        sftp.get_channel.return_value=Channel()
+        sftp.open.return_value=Target()
+        client=Mock();client.open_sftp.return_value=sftp
+        self.cluster.execute=Mock(side_effect=AssertionError('Partial upload was published'))
+        self.cluster._active_deadline=3
+        with patch('cluster.time.monotonic',side_effect=lambda:clock['now']):
+            with self.assertRaisesRegex(TimeoutError,'Lifecycle'):
+                self.cluster.put(client,source,'/personal/run/input')
+        self.cluster.execute.assert_not_called()
+        sftp.remove.assert_not_called()
+        sftp.close.assert_called_once()
+        self.assertEqual(timeouts,[3,3,1])
 
 
 class RunnerTests(unittest.TestCase):

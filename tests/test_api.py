@@ -80,6 +80,37 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(factory.call_count, 1)
         api.close()
         self.assertIsNone(api.connection)
+    def test_connect_and_request_do_not_restart_outer_deadline_for_headers(self):
+        now = [0.0]
+        api, connection, _ = self.make([Response('ok')], deadline_provider=lambda: 6.0)
+        connect = connection.connect
+        request = connection.request
+        observed_timeouts = []
+        def slow_connect():
+            connect(); now[0] += 3
+            connection.sock.settimeout = observed_timeouts.append
+        def slow_request(*args, **kwargs):
+            request(*args, **kwargs); now[0] += 2
+        connection.connect = slow_connect
+        connection.request = slow_request
+        with patch('api.time.monotonic', side_effect=lambda: now[0]):
+            self.assertEqual(api.call('POST', '/api/test'), 'ok')
+        self.assertEqual(len(connection.requests), 1)
+        self.assertEqual(observed_timeouts[0], 6.0)
+        self.assertEqual(observed_timeouts[1], 3.0)
+        self.assertTrue(all(value <= 1 for value in observed_timeouts[2:]))
+    def test_exhausted_outer_deadline_after_tls_sends_no_mutation(self):
+        now = [0.0]
+        api, connection, _ = self.make([Response('unreachable')], deadline_provider=lambda: 5.0)
+        connect = connection.connect
+        def slow_connect():
+            connect(); now[0] = 6.0
+        connection.connect = slow_connect
+        with patch('api.time.monotonic', side_effect=lambda: now[0]):
+            with self.assertRaises(ApiError):
+                api.call('POST', '/api/test')
+        self.assertEqual(connection.requests, [])
+        self.assertEqual(connection.connects, 1)
     def test_read_retries_transient_failure_and_gateway(self):
         api, connection, _ = self.make([http.client.RemoteDisconnected("synthetic"), Response(status=503), Response("ok")])
         self.assertEqual(api.call("GET", "/api/test"), "ok")

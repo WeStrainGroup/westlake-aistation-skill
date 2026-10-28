@@ -8,6 +8,8 @@
   "image": "registry.example.edu/team/pytorch:tag",
   "framework": "pytorch",
   "card_type": "YOUR_GPU_MODEL",
+  "storage": "master",
+  "storage_mount": "/YOUR_ACCOUNT",
   "persistent_root": "/YOUR_ACCOUNT/compute_runs",
   "remote_python": "/opt/conda/bin/python",
   "max_environment_seconds": 14400

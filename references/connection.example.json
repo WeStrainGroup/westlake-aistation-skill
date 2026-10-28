@@ -1,0 +1,6 @@
+{
+  "portal": "https://aistation.example.edu",
+  "account": "YOUR_ACCOUNT",
+  "ca_file": "~/private/aistation.pem",
+  "certificate_sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_A_TRUSTED_SOURCE"
+}

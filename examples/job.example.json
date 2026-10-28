@@ -1,0 +1,25 @@
+{
+  "run_id": "example_development_run",
+  "purpose": "development",
+  "backend": "environment",
+  "cpus": 12,
+  "gpus": 1,
+  "max_seconds": 600,
+  "ready_timeout": 150,
+  "preparation_seconds": 300,
+  "collection_seconds": 120,
+  "cleanup_seconds": 60,
+  "argv": [
+    "/opt/conda/bin/python",
+    "-u",
+    "{run_dir}/main.py",
+    "--output",
+    "{run_dir}/result.json"
+  ],
+  "uploads": [
+    {"local": "/absolute/project/main.py", "remote": "{run_dir}/main.py"}
+  ],
+  "downloads": [
+    {"remote": "{run_dir}/result.json", "local": "/absolute/project/results/result.json"}
+  ]
+}
