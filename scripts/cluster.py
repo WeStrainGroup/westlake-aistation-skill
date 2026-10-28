@@ -33,6 +33,15 @@ ROOT = Path(__file__).resolve().parent
 TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "BLOCKED", "COLLECTION_FAILED"}
 
 
+def safe_error(error):
+    result = {'type': type(error).__name__}
+    for attribute in ('code', 'operation', 'method', 'safe_server_message'):
+        value = getattr(error, attribute, None)
+        if value:
+            result[attribute] = value
+    return result
+
+
 class RemoteExecutionTimeout(TimeoutError):
     """Safe default message; partial job output is opt-in diagnostic data only."""
     def __init__(self, stdout, stderr):
@@ -263,6 +272,12 @@ class Cluster:
     def environment(self, environment_id):
         return self._call("GET", f"/api/iresource/v1/work-platform/{environment_id}/detail")
 
+    def groups(self, purpose='development'):
+        if purpose not in ('development', 'training'):
+            raise ValueError('Group purpose must be development or training')
+        labels = 'develop,usual' if purpose == 'development' else 'usual,train'
+        return self.pages('/api/iresource/v1/node-group', {'groupLabel': labels, 'groupStatus': 1})
+
     def env_payload(self, spec):
         return {"wpType": "COMMON_WP", "jupyterType": 0, "wpName": "wl_" + spec["run_id"],
                 "groupId": spec.get("resource_group_id", self.profile["development_group_id"]), "wpPodNum": 1,
@@ -281,6 +296,9 @@ class Cluster:
                     raise ValueError(f"Download destination already exists: {entry['local']}")
         eligible = None
         if online:
+            groups = self.groups('development')
+            if not any(str(group.get('groupId')) == spec['resource_group_id'] for group in groups):
+                raise ValueError('Selected group does not support development environments; use task management for a training group')
             nodes = self.resources(spec.get("resource_group_id", self.profile["development_group_id"]))
             eligible = [node["node"] for node in nodes if node["available_cpus"] >= spec["cpus"]
                         and node["available_gpus"] >= spec["gpus"]
@@ -323,8 +341,8 @@ class Cluster:
                 with self._phase(run_id, 'preparation'):
                     created = self._call("POST", "/api/iresource/v1/work-platform/",
                                          body=self.env_payload(record["spec"]))
-            except BaseException:
-                self.registry.update(run_id, state="UNKNOWN", uncertain_action="allocation")
+            except BaseException as error:
+                self.registry.update(run_id, state="UNKNOWN", uncertain_action="allocation", creation_error=safe_error(error))
                 raise
             resource_id = (created.get("wpId") or created.get("id")) if isinstance(created, dict) else created if isinstance(created, str) else None
             if not resource_id:
@@ -353,6 +371,10 @@ class Cluster:
             self._check_cancelled(run_id)
             detail = self.environment(record["resource_id"])
             state = detail.get("wpStatus")
+            if state == 'Deleted':
+                self.registry.update(run_id, state='FAILED', platform_state=state, resource_released=True,
+                                     final_resource_state=state, platform_failure='Environment deleted before readiness')
+                raise RuntimeError('Platform deleted the environment before readiness; inspect platform events and quotas')
             if detail.get("userId") != self.user["userId"]:
                 raise RuntimeError("Environment belongs to a different account")
             if state != previous:
@@ -725,9 +747,9 @@ class Cluster:
                 return record
             resource_id = record['resource_id']
             detail = self.environment(resource_id)
-            if detail.get('userId') != self.user['userId']:
+            if detail.get('userId') != self.user['userId'] and not (detail.get('wpStatus') == 'Deleted' and detail.get('userId') is None):
                 raise RuntimeError('Refusing to stop an environment owned by another account')
-            released = ('Pause', 'Halt', 'Failed')
+            released = ('Pause', 'Halt', 'Failed', 'Deleted')
             current = detail.get('wpStatus')
             deadline = min(time.monotonic() + timeout, self._active_deadline)
             pause_sent = False
@@ -749,7 +771,7 @@ class Cluster:
                     raise TimeoutError('Resource release is not confirmed; inspect status before retrying')
                 time.sleep(min(2,remaining))
                 detail = self.environment(resource_id)
-                if detail.get('userId') != self.user['userId']:
+                if detail.get('userId') != self.user['userId'] and not (detail.get('wpStatus') == 'Deleted' and detail.get('userId') is None):
                     raise RuntimeError('Environment ownership changed during stop')
                 current = detail.get('wpStatus')
             return self.registry.update(run_id, platform_state=current, final_resource_state=current,
@@ -958,7 +980,8 @@ class Cluster:
         except BaseException as error:
             current = self.registry.get(run_id)
             if current['state'] not in ('CANCELLED','UNKNOWN','COLLECTION_FAILED'):
-                self.registry.update(run_id,state='TIMED_OUT' if isinstance(error,TimeoutError) else 'FAILED',error=type(error).__name__)
+                self.registry.update(run_id,state='TIMED_OUT' if isinstance(error,TimeoutError) else 'FAILED',
+                                     error=type(error).__name__, failure=safe_error(error))
                 # An unconfirmed/running computation must not be marked fully collected.
                 if current.get('compute_state',current.get('result',{}).get('state')) in ('SUCCEEDED','FAILED','TIMED_OUT','CANCELLED'):
                     try: self.finish(run_id)
@@ -975,13 +998,15 @@ class Cluster:
                     except Exception: pass
             raise
         finally:
+            primary_error = sys.exc_info()[1]
             current = self.registry.get(run_id)
             cleanup_due = current.get('lease_deadline_epoch', float('inf')) - time.time() <= spec.get('cleanup_seconds', 60)
             if current.get('resource_id') and (current['state'] not in ('UNKNOWN','COLLECTION_FAILED') or cleanup_due):
                 try: self.stop_environment(run_id)
                 except Exception as error:
-                    self.registry.update(run_id,cleanup_error=type(error).__name__,resource_released=False)
-                    raise
+                    self.registry.update(run_id,cleanup_error=type(error).__name__, cleanup_failure=safe_error(error),resource_released=False)
+                    if primary_error is None:
+                        raise
         return self.registry.get(run_id)
 
     def logs(self, run_id, lines=100):

@@ -117,18 +117,53 @@ class CLITests(unittest.TestCase):
             self.assertEqual(plan['upload_total_bytes'], script.stat().st_size)
             self.assertEqual(plan['spec']['argv'][-2:], ['--batch-size', '16'])
 
-    def test_training_guide_is_local_and_execution_remains_disabled(self):
+    def test_training_plan_and_guide_are_local_and_never_fall_back_to_development(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); profile = root / 'profile.json'
-            profile.write_text(json.dumps(self.profile_source(root)))
-            script = root / 'train.py'; script.write_text('print(42)\n')
+            source = self.profile_source(root)
+            source['training_group_id'] = 'example-training'
+            profile.write_text(json.dumps(source))
             job, guide = root / 'training.json', root / 'task-guide.md'
             with contextlib.redirect_stdout(io.StringIO()), patch('cluster.get_password', side_effect=AssertionError('Guide authenticated')):
-                self.assertEqual(cli.main(['--profile', str(profile), 'job', '--script', str(script), '--purpose', 'training', '--minutes', '2880', '--out', str(job)]), 0)
+                self.assertEqual(cli.main(['--profile', str(profile), 'job', '--remote-script', '/example-user/train.py', '--purpose', 'training', '--minutes', '2880', '--out', str(job)]), 0)
                 self.assertEqual(cli.main(['--profile', str(profile), 'task-guide', '--spec', str(job), '--out', str(guide)]), 0)
                 with self.assertRaises(ValueError):
                     cli.main(['--profile', str(profile), 'run', '--spec', str(job), '--execute'])
             self.assertIn('https://hpc.westlake.edu.cn/document/ai/aistation/6.task.html', guide.read_text())
+
+    def test_training_configuration_does_not_require_development_ssh_trust(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); profile = root / 'profile.json'
+            source = self.profile_source(root)
+            source.pop('ssh_host_fingerprint'); source.pop('development_group_id')
+            profile.write_text(json.dumps(source))
+            with contextlib.redirect_stdout(io.StringIO()), patch('cluster.Cluster') as cluster:
+                self.assertEqual(cli.main(['--profile', str(profile), 'configure', '--purpose', 'training',
+                                           '--group-id', 'example-training']), 0)
+                cluster.assert_not_called()
+            saved = json.loads(profile.read_text())
+            self.assertEqual(saved['training_group_id'], 'example-training')
+            self.assertNotIn('development_group_id', saved)
+            self.assertNotIn('ssh_host_fingerprint', saved)
+
+    def test_native_plan_is_offline_with_connection_and_training_settings_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); profile = root / 'profile.json'
+            source = self.profile_source(root)
+            source.pop('ssh_host_fingerprint'); source.pop('development_group_id')
+            source['training_group_id'] = 'example-training'
+            profile.write_text(json.dumps(source))
+            spec = root / 'native.json'
+            spec.write_text(json.dumps({'run_id': 'native_offline', 'max_seconds': 86400,
+                                        'argv': ['/opt/conda/bin/python', '/example-user/train.py']}))
+            with contextlib.redirect_stdout(io.StringIO()) as output, \
+                 patch('native.get_password', side_effect=AssertionError('offline authentication')):
+                self.assertEqual(cli.main(['--profile', str(profile), '--state-dir', str(root / 'state'),
+                                           'task-plan', '--spec', str(spec)]), 0)
+            plan = json.loads(output.getvalue())
+            self.assertEqual(plan['backend'], 'native')
+            self.assertFalse(plan['availability_checked'])
+            self.assertFalse(plan['submitted'])
 
 
 if __name__ == '__main__':

@@ -8,7 +8,7 @@
 | --- | --- |
 | [账号与登录](https://hpc.westlake.edu.cn/document/ai/aistation/2.account.html)：首次修改初始密码；校外使用学校 VPN，WebVPN 无效 | 用户先完成账号开通及首次密码设置；CLI 配置自己的连接和隐藏凭据 |
 | [开发环境](https://hpc.westlake.edu.cn/document/ai/aistation/5.dev.html)：用于代码调试；默认挂载个人目录 | 开发后端用于调试和短验证，执行前核验配置的实际挂载 |
-| [任务提交](https://hpc.westlake.edu.cn/document/ai/aistation/6.task.html)：调试后在任务管理运行；时限按资源组，许多组五天；应做 checkpoint | 正式训练生成 `task-guide` 网页填写清单，核对组时限、镜像、绝对命令、挂载、checkpoint 和输出；不冒充原生 API 已可用 |
+| [任务提交](https://hpc.westlake.edu.cn/document/ai/aistation/6.task.html)：调试后在任务管理运行；时限按资源组，许多组五天；应做 checkpoint | 正式训练生成原生 `task-plan` 并核对组时限、镜像、绝对命令、挂载、checkpoint 和输出；当前创建需显式实验开关，不宣称生产可用；保留 `task-guide` 人工清单 |
 | [资源限制](https://hpc.westlake.edu.cn/document/ai/aistation/3.resource.html#id3)：开发环境四小时；单用户默认最多 25 张卡、500 核 CPU；组存储配额限制 | 全部开发阶段使用同一总时限；单作业参数范围不等于账号剩余配额证明；写入失败需检查组配额 |
 | [排队条件](https://hpc.westlake.edu.cn/document/ai/aistation/9.faq.html#id18)：CPU 与 GPU 都需满足节点剩余资源 | 联网计划和执行检查同一节点的 CPU/GPU；离线计划不声明有资源 |
 | [存储管理](https://hpc.westlake.edu.cn/document/ai/aistation/4.data_file.html#id2)：master 在 `/<account>`，SSD 在 `/ssdwork/<account>`；SSD 空间和组配额有限 | 默认 master；用户明确选择 SSD 后才使用，不自动迁移；自定义存储须明确真实挂载 |
@@ -28,11 +28,14 @@
 - 默认为离线的 `plan`、显式 `--execute`、每运行独立锁和唯一 ID、未知创建结果必须先对账。
 - HTTPS 证书与 SSH 指纹核验、系统凭据库、原子状态、SHA-256 传输校验和不可覆盖发布。
 - 执行前挂载检查及小写入探测。`df` 只反映文件系统容量，不是实验室组配额查询；一次小写入通过也不保证大型计算不会耗尽配额。
-- 本机控制器及超时看门狗。它们不能承诺长期断网时立即回收结果或释放资源，也不能修复共享存储服务本身的延迟。
+- 开发后端使用本机控制器及超时看门狗，长期断网不保证立即回收结果或释放资源。原生任务由平台管理，本机观察断开不取消任务；两者都不能修复共享存储服务延迟。
+- 原生启动 guard 检查真实挂载与 GPU，保留每次 attempt 的执行证据；无终态证据的成功任务标记未验证。科学结果仍需独立检查。
+- 新建原生任务默认拒绝，显式实验开关只用于有界诊断。发布 GitHub 后必须同步本机 skill 与 canonical CLI，核对同一提交版本。
 
 ## 部署实测与尚未支持的部分
 
 - 公开预览版此前完成了开发环境资源申请和真实 GPU 型号核验，但遇到共享目录创建超时，尚未得到公开改版 GPU 全流程 PASS。离线及本地进程测试与实机验证分别报告。
-- 原生训练 GPU 提交未通过兼容性验证，保持禁用。`task-guide` 仅准备网页填写说明；手册没有为这里观察到的 API 字段提供正式兼容性承诺。
+- 本轮官方任务表单的 1 GPU 请求经精确转发仍被服务端改为 CPU/0 GPU，真实 CUDA 检查失败，测试任务已终止。创建默认拒绝；`--experimental-native` 只打开有界诊断，不表示问题已解决。手册未提供这里观察到的 API 字段兼容性保证。
+- 已实现原生单任务计划、提交诊断、状态、日志、停止、对账与本机观察。尚未完成 GPU 生产全流程实测，因此不提供生产批量派发或自动重试正式训练。
 - 独立存储 SFTP 尚未纳入自动化执行。手册的文件管理页和 FAQ 在端口及部分 SSD 服务端路径写法上存在差异；使用前通过可信渠道核实自己的入口、主机身份、路径和权限，不从示例推断。
 - 多节点训练、自动 checkpoint 分段、跨机器共享凭据不在当前自动执行范围。手册描述的能力不等于这个社区客户端已经实现。

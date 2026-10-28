@@ -1,30 +1,30 @@
 ---
 name: westlake-aistation
-description: Use a configured Westlake AIStation account for development-environment debugging, bounded validation jobs, resource and storage checks, monitoring and result recovery; prepare a web-submission guide for formal training.
+description: Use a configured Westlake AIStation account for debugging, resource checks, bounded compute and monitoring; prepare and diagnose native task-management jobs with explicit compatibility checks.
 ---
 
 # Westlake AIStation
 
-Use `scripts/wlai` relative to this skill directory. This is a community adapter for AIStation/Kubernetes, not an official SDK or Slurm client. The [manual map](references/manual.md) distinguishes official requirements, client safeguards and deployment observations.
+Use `scripts/wlai` relative to this skill directory. This community adapter uses AIStation/Kubernetes, not Slurm. Read [setup and command reference](references/usage.md) for configuration and [manual map](references/manual.md) for official requirements and tested boundaries.
 
-For new users, follow [setup and command reference](references/usage.md). `init --connection-only --server-cert /trusted/server.pem` configures only the connection; the PEM must come from a trusted source. Then authenticate, inspect `resources --group all --format table`, and use `configure` to complete resource group, image, GPU model, SSH fingerprint and storage. Full `init` is also available. Users supply their own account; passwords use hidden input and optional system credential storage. Never put credentials in specs, command arguments, logs or source control.
+Users supply their own account and trusted server certificate. Passwords use hidden input and optional system credential storage; never place them in specs, arguments, environment variables, logs or source control. HTTPS and container SSH identities must match trusted configuration. A changed identity requires independent verification.
 
 ## Choose the workflow
 
-- Development/debugging or a short validation: generate with `job --script /absolute/main.py --minutes 30 --out job.json -- ...`; inspect offline `plan --spec job.json`, then `plan --spec job.json --online`. Offline plans do not establish live availability. Execute only the user's authorized inputs, parameters, resources and outputs, presenting a concrete plan before substantial compute.
-- Formal training: use `job --purpose training ...` then `task-guide --spec training-job.json --out task-guide.md`. This exports a web-form guide only. The manual expects debugged code to run through task management; native GPU API submission remains disabled. Do not route long training through development environments or guess API fields.
+- Debugging and short validation: `job --script /absolute/main.py --minutes 30 --out job.json -- ...`, offline `plan --spec job.json`, then `plan --spec job.json --online`. Offline planning does not prove live availability. Use `run` or `submit --execute` only within the user's authorized inputs, resources and output scope. Present a concrete plan before substantial compute.
+- Formal training belongs in task management. Stage code and data once in persistent storage, configure a training group, and generate with `job --purpose training --remote-script /personal/train.py ...`. Use `task-plan`, `task-status`, `task-logs`, `task-watch`, `task-reconcile` and `task-stop` for native-task records. Single-node multiple GPU requests are supported by the planner; the generated command is one Python process, so verify that the program itself starts all GPUs or supply an explicit launcher in `spec.argv`. Independent tasks are not multi-node DDP.
+- **Native creation is experimental in this preview.** A live official-form request for one GPU was accepted but changed by the service to CPU/zero GPU. `task-submit --execute` therefore refuses new creation unless explicitly given `--experimental-native` for a bounded diagnostic. This switch is not production approval. Do not submit a production batch, retry guessed API fields, or use development environments to work around long-training limits. `task-guide` remains a manual form checklist; it does not prove that a GPU was allocated.
 
 ## Run, observe and verify
 
-1. Choose master or, with explicit user intent, `ssdwork`; SSD is charged and group-quota limited. Do not silently migrate data to it. Runtime must verify the configured mount before executing. `storage-check --run-id ID` checks an existing environment only; `df` does not prove group quota is available.
-2. Use `run --spec job.json --execute` for foreground control, or `submit --spec job.json --execute` with a system credential store for a detached local controller. The client machine must remain powered and connected. Execution rechecks CPU/GPU availability together on one node; a plan is not a reservation.
-3. Other agents sharing the profile can inspect `runs`, `status`, `logs`, `metrics` or read-only `watch`. Same ID/spec is reused; changed code or parameters need a new ID.
-4. Check scientific outputs, downloaded hashes, `resource_released=true` and confirmed platform state. Exit code zero is not scientific validation.
+1. Discover `groups --purpose development|training` and current resources. Groups are checked against workload labels; visible GPU nodes alone do not authorize development allocation. CPU and GPU must fit together on one node, and account quota still applies.
+2. Use verified master storage by default. SSD `ssdwork` requires explicit user intent and has separate group quota and charges. Verify the configured mount before creating the run directory. Never create a lookalike mount or change ACLs to bypass a failed check. `df` does not prove group quota.
+3. Development `submit` runs a local controller; keep its machine powered and connected. Development has a four-hour platform lifetime, including preparation, transfers, computation, collection and cleanup. The client program cap is 13,800 seconds, with additional stage budgets. Native tasks, once accepted, belong to the platform and continue when the observer disconnects; group-specific runtime limits still apply.
+4. Agents sharing a profile should share its account-scoped registry. Identical run IDs/specs reuse records; changed code or parameters require a new ID. An uncertain creation becomes `UNKNOWN`: reconcile before any new creation POST. Do not automatically adopt legacy unscoped state.
+5. Confirm actual GPU count/model and persistent output evidence. Native guards run before scientific code and retain attempt receipts; platform success without a valid guard receipt is `COMPLETED_UNVERIFIED`. Exit zero and hardware verification do not validate scientific results. Observe logs/checkpoints/metrics and confirm resource release. `Deleted` is a released terminal state, not a reason to wait or repeatedly stop it.
 
-## Limits and recovery
+## Updates shared by agents
 
-- Development environments have a four-hour platform limit. Preparation, transfer, program, collection and cleanup must all fit. The 13,800-second program cap and stage allowances are client safeguards, not additional manual rules. Formal-task limits vary by resource group and require checkpoint planning.
-- Store results and environments on verified persistent mounts, using absolute executable paths and timely logs (`python -u` or explicit flushing). Avoid using a GPU environment for lengthy bulk transfers. See the manual map for standalone SFTP caveats.
-- An uncertain creation or launch becomes `UNKNOWN`; use `reconcile`, never blindly repeat it. If collection fails, inspect the preserved compute state and recover with `collect` while the environment is accessible. Finish with verified `stop`. Read [recovery details](references/usage.md) before taking over an interrupted controller.
-- HTTPS and SSH identities must match trusted configuration. A changed certificate/key requires independent verification; do not disable identity checks or export passwords to bypass a restricted sandbox. Keep account-scoped controller state on a local POSIX filesystem.
-- The public preview has not yet passed a complete live GPU workflow on the tested deployment. Preserve that distinction from passing offline tests when reporting readiness.
+After every GitHub release, locate the separate reviewed source checkout and run its absolute `scripts/install_local.py` path; the installed skill exposes a CLI wrapper, not the source checkout or installer. Install that same commit locally; update the discoverable skill and any pre-existing canonical CLI path together. Verify both `--version` outputs and `INSTALLATION.json` revision/content hash. Updating GitHub alone leaves other agents on old code.
+
+Install immutable snapshots and switch wrappers; do not edit a version used by a running controller. Preserve private profiles, credential-store entries, certificates, data and legacy receipts. For the exact install/rollback commands, read [installation and updates](references/usage.md#installation-and-updates). Existing agents should reread the installed skill before the next operation after an upgrade.

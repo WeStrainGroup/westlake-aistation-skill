@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 SCRIPTS=Path(__file__).resolve().parents[1]/'scripts'
 sys.path.insert(0,str(SCRIPTS))
 from cluster import Cluster, prepare_spec, RemoteExecutionTimeout
+from api import ApiError
 from registry import Registry, profile_identity
 
 
@@ -41,6 +42,8 @@ class RuntimeTests(unittest.TestCase):
         self.cluster._user={'userId':'example-owner'}
         self.cluster.resources=Mock(return_value=[{'node':'example-node','available_cpus':500,
                                                    'available_gpus':25,'card_type':'Example GPU'}])
+        self.cluster.groups=Mock(return_value=[{'groupId':'example-group','groupLabel':'develop'},
+                                               {'groupId':'usual-group','groupLabel':'usual'}])
         return self.cluster._client
 
     def allocated(self,**values):
@@ -379,6 +382,131 @@ class RuntimeTests(unittest.TestCase):
         self.cluster.resources.assert_called_once()
         client.call.assert_not_called()
         self.assertEqual(self.cluster.registry.get('example')['state'],'PLANNED')
+
+    def test_group_queries_use_workload_labels_instead_of_gpu_model_guessing(self):
+        self.cluster.pages=Mock(return_value=[])
+        self.cluster.groups('development')
+        self.cluster.groups('training')
+        self.assertEqual(self.cluster.pages.call_args_list[0].args,
+                         ('/api/iresource/v1/node-group', {'groupLabel':'develop,usual','groupStatus':1}))
+        self.assertEqual(self.cluster.pages.call_args_list[1].args,
+                         ('/api/iresource/v1/node-group', {'groupLabel':'usual,train','groupStatus':1}))
+        with self.assertRaises(ValueError):self.cluster.groups('unknown')
+        self.assertEqual(self.cluster.pages.call_count,2)
+
+    def test_training_only_group_cannot_be_allocated_as_development(self):
+        client=self.fake_client()
+        spec=prepare_spec({'run_id':'training_group','argv':['/bin/true'],'gpus':0,
+                           'resource_group_id':'training-only-group'},profile())
+        self.cluster.registry.reserve(spec['run_id'],spec,'run')
+        with self.assertRaisesRegex(ValueError,'does not support development'):
+            self.cluster.create_environment(spec['run_id'])
+        self.cluster.groups.assert_called_once_with('development')
+        self.cluster.resources.assert_not_called()
+        client.call.assert_not_called()
+        self.assertEqual(self.cluster.registry.get(spec['run_id'])['state'],'PLANNED')
+
+    def test_usual_group_is_valid_for_development_allocation(self):
+        client=self.fake_client();client.call.return_value={'wpId':'usual-environment'}
+        spec=prepare_spec({'run_id':'shared_group','argv':['/bin/true'],'gpus':0,
+                           'resource_group_id':'usual-group'},profile())
+        self.cluster.registry.reserve(spec['run_id'],spec,'run')
+        record=self.cluster.create_environment(spec['run_id'])
+        self.assertEqual(record['resource_id'],'usual-environment')
+        self.assertEqual(client.call.call_args.kwargs['body']['groupId'],'usual-group')
+        self.assertEqual(client.call.call_count,1)
+
+    def test_training_group_query_excludes_development_only_labels(self):
+        from native import NativeTasks
+        client=Mock()
+        client.call.return_value=[{'groupId':'dev-only','groupLabel':'develop'},
+                                  {'groupId':'shared','groupLabel':'usual'},
+                                  {'groupId':'train-only','groupLabel':'train'},
+                                  {'groupId':'listed-train','groupLabel':['train','custom']}]
+        tasks=NativeTasks(profile=profile(),state_dir=self.root/'native',client=client,
+                          user={'userId':'example-owner'})
+        selected=tasks.training_groups()
+        self.assertEqual({row['groupId'] for row in selected},{'shared','train-only','listed-train'})
+        client.call.assert_called_once_with('GET','/api/iresource/v1/node-group',
+            params={'groupLabel':'usual,train','page':-1,'groupStatus':1})
+
+    def test_deleted_environment_is_confirmed_released_without_pause_or_delete(self):
+        self.allocated();client=self.fake_client()
+        self.cluster.environment=Mock(return_value={'wpStatus':'Deleted'})
+        record=self.cluster.stop_environment('example')
+        self.assertTrue(record['resource_released'])
+        self.assertEqual(record['final_resource_state'],'Deleted')
+        client.call.assert_not_called()
+
+    def test_deleted_before_readiness_reports_original_platform_state(self):
+        self.allocated()
+        self.cluster.environment=Mock(return_value={'wpStatus':'Deleted'})
+        with patch('cluster.get_password',side_effect=AssertionError('Deleted state triggered authentication')):
+            with self.assertRaisesRegex(RuntimeError,'deleted the environment before readiness'):
+                self.cluster.wait_environment('example')
+        record=self.cluster.registry.get('example')
+        self.assertEqual(record['state'],'FAILED')
+        self.assertEqual(record['platform_state'],'Deleted')
+        self.assertTrue(record['resource_released'])
+
+    def test_pending_environment_deleted_by_platform_does_not_request_pause(self):
+        self.allocated();client=self.fake_client()
+        self.cluster.environment=Mock(side_effect=[{'userId':'example-owner','wpStatus':'Pending'},
+                                                   {'wpStatus':'Deleted'}])
+        with patch('cluster.time.sleep',return_value=None):
+            record=self.cluster.stop_environment('example')
+        self.assertTrue(record['resource_released'])
+        self.assertEqual(record['final_resource_state'],'Deleted')
+        client.call.assert_not_called()
+
+    def test_cleanup_failure_keeps_original_error_and_its_safe_diagnostics(self):
+        self.allocated()
+        record=self.cluster.registry.get('example')
+        original=ApiError('Original readiness failure',
+            code='IRESOURCE_CREATE_WORK_PLATFORM_RES_GROUP_NOT_MATCH_LABEL',
+            operation='/api/iresource/v1/work-platform/',method='POST')
+        cleanup=ApiError('Secondary cleanup failure',status=503,
+            operation='/api/iresource/v1/work-platform/pause/example-env',method='PUT')
+        self.cluster.create_environment=Mock(return_value=record)
+        self.cluster.wait_environment=Mock(side_effect=original)
+        self.cluster.stop_environment=Mock(side_effect=cleanup)
+        with self.assertRaises(ApiError) as caught:self.cluster._run_owned(self.spec)
+        self.assertIs(caught.exception,original)
+        failed=self.cluster.registry.get('example')
+        self.assertEqual(failed['failure']['code'],original.code)
+        self.assertEqual(failed['failure']['operation'],original.operation)
+        self.assertEqual(failed['cleanup_failure']['operation'],cleanup.operation)
+        self.assertFalse(failed['resource_released'])
+
+    def test_cleanup_error_is_raised_when_computation_had_no_primary_error(self):
+        self.allocated(remote_runner_pid=123)
+        self.cluster.create_environment=Mock(return_value=self.cluster.registry.get('example'))
+        self.cluster.wait_environment=Mock()
+        self.cluster.watch=Mock(side_effect=lambda *args,**kwargs:self.cluster.registry.update('example',
+            state='SUCCEEDED',compute_state='SUCCEEDED',result={'state':'SUCCEEDED'},collection_complete=True))
+        cleanup=ApiError('Stop request rejected',code='COMMON_PARAMETER_NOT_MATCH',
+            operation='/api/iresource/v1/work-platform/pause/example-env',method='PUT')
+        self.cluster.stop_environment=Mock(side_effect=cleanup)
+        with self.assertRaises(ApiError) as caught:self.cluster._run_owned(self.spec)
+        self.assertIs(caught.exception,cleanup)
+        failed=self.cluster.registry.get('example')
+        self.assertEqual(failed['state'],'SUCCEEDED')
+        self.assertEqual(failed['cleanup_failure']['code'],cleanup.code)
+        self.assertFalse(failed['resource_released'])
+
+    def test_count_limit_rejection_retains_code_without_attempting_cleanup(self):
+        client=self.fake_client()
+        original=ApiError('Development count exceeded',code='IRESOURCE_MAX_WOKR_PLATFORM_COUNT_EXCEED',
+            operation='/api/iresource/v1/work-platform/',method='POST')
+        client.call.side_effect=original
+        self.cluster.stop_environment=Mock(side_effect=AssertionError('No allocated resource to stop'))
+        with self.assertRaises(ApiError) as caught:self.cluster.run(self.spec)
+        self.assertIs(caught.exception,original)
+        failed=self.cluster.registry.get('example')
+        self.assertEqual(failed['creation_error']['code'],original.code)
+        self.assertEqual(failed['state'],'UNKNOWN')
+        self.cluster.stop_environment.assert_not_called()
+        self.assertEqual(client.call.call_count,1)
 
     def test_training_and_overbudget_jobs_are_rejected_without_execution(self):
         with self.assertRaisesRegex(ValueError,'task-guide'):

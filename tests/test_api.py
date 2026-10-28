@@ -161,6 +161,68 @@ class ApiTests(unittest.TestCase):
         message = repr(failure.exception) + repr(api.timings) + failure.exception.server_message
         for secret in ("SYNTHETIC_SECRET", "synthetic-secret", "synthetic-query-secret"):
             self.assertNotIn(secret, message)
+        self.assertEqual(failure.exception.code, 'PLATFORM_REJECTED')
+        self.assertEqual(failure.exception.operation, '/api/test')
+    def test_known_vendor_codes_are_retained_with_only_local_safe_messages(self):
+        for code in ('IRESOURCE_MAX_WOKR_PLATFORM_COUNT_EXCEED',
+                     'IRESOURCE_INPUT_GPU_MORE_THAN_WORK_PLATFORM_CONFIG_LIMIT',
+                     'IRESOURCE_CREATE_WORK_PLATFORM_RES_GROUP_NOT_MATCH_LABEL',
+                     'IRESOURCE_COMMON_RES_GROUP_CAN_NOT_BE_USED',
+                     'COMMON_PARAMETER_NOT_MATCH'):
+            raw = json.dumps({'flag': False, 'errCode': code, 'errMessage': 'synthetic-response-secret',
+                              'resData': {'password': 'synthetic-response-secret'}}).encode()
+            api, connection, _ = self.make([Response(raw=raw)])
+            with self.subTest(code=code), self.assertRaises(ApiError) as failure:
+                api.call('POST', '/api/iresource/v1/work-platform/',
+                         params={'k': 'synthetic-query-secret'}, body={'password': 'synthetic-request-secret'})
+            error = failure.exception
+            self.assertEqual(error.code, code)
+            self.assertEqual(error.operation, '/api/iresource/v1/work-platform/')
+            self.assertEqual(error.method, 'POST')
+            self.assertIn(code, str(error))
+            self.assertTrue(error.safe_server_message)
+            diagnostics = str(error) + repr(error.__dict__) + repr(api.timings)
+            for secret in ('synthetic-response-secret', 'synthetic-query-secret', 'synthetic-request-secret'):
+                self.assertNotIn(secret, diagnostics)
+            self.assertEqual(len(connection.requests), 1)
+    def test_vendor_code_validation_is_bounded_and_has_no_raw_message_fallback(self):
+        prefix = 'ISTORAGE_'
+        accepted = prefix + 'X' * (128 - len(prefix))
+        for raw_code, expected in [(accepted, accepted), (accepted + 'X', 'PLATFORM_REJECTED'),
+                                   ('IBASE_REQUEST_REJECTED_1', 'IBASE_REQUEST_REJECTED_1'),
+                                   ('IIMAGE_REQUEST_REJECTED_1', 'IIMAGE_REQUEST_REJECTED_1'),
+                                   ('IRESOURCE_lowercase_secret', 'PLATFORM_REJECTED'),
+                                   ('COMMON_BAD\nsynthetic-secret', 'PLATFORM_REJECTED'),
+                                   ('UNRELATED_SECRET', 'PLATFORM_REJECTED'),
+                                   (None, 'PLATFORM_REJECTED')]:
+            raw = json.dumps({'flag': False, 'errCode': raw_code, 'errMessage': 'synthetic-secret'}).encode()
+            api, _, _ = self.make([Response(raw=raw)])
+            with self.subTest(raw_code=raw_code), self.assertRaises(ApiError) as failure:
+                api.call('GET', '/api/test')
+            self.assertEqual(failure.exception.code, expected)
+            self.assertEqual(failure.exception.safe_server_message, '')
+            self.assertNotIn('synthetic-secret', str(failure.exception) + repr(failure.exception.__dict__))
+    def test_401_and_transport_timeout_preserve_original_operation_without_query(self):
+        for outcome in (Response(status=401), TimeoutError('synthetic-transport-secret')):
+            api, connection, _ = self.make([outcome])
+            with self.subTest(outcome=type(outcome).__name__), self.assertRaises(ApiError) as failure:
+                api.call('POST', '/api/iresource/v1/train', params={'k': 'synthetic-query-secret'})
+            self.assertEqual(failure.exception.operation, '/api/iresource/v1/train')
+            self.assertEqual(failure.exception.method, 'POST')
+            if isinstance(outcome, Response):
+                self.assertEqual(failure.exception.status, 401)
+            self.assertEqual(len(connection.requests), 1)
+            diagnostics = str(failure.exception) + repr(failure.exception.__dict__) + repr(api.timings)
+            self.assertNotIn('synthetic-query-secret', diagnostics)
+            self.assertNotIn('synthetic-transport-secret', diagnostics)
+    def test_raw_server_message_argument_cannot_populate_diagnostics(self):
+        error = ApiError('Rejected', code='IRESOURCE_MAX_WOKR_PLATFORM_COUNT_EXCEED',
+                         server_message='synthetic-secret', operation='/api/test?k=synthetic-query-secret', method='POST')
+        self.assertEqual(error.operation, '/api/test')
+        self.assertTrue(error.safe_server_message)
+        self.assertEqual(error.server_message, error.safe_server_message)
+        self.assertNotIn('synthetic-secret', repr(error.__dict__))
+        self.assertNotIn('synthetic-query-secret', repr(error.__dict__))
     def test_invalid_json_body_suppressed(self):
         api, _, _ = self.make([Response(raw=b"synthetic-sensitive-non-json")])
         with self.assertRaises(ApiError) as failure:

@@ -1,4 +1,4 @@
-"""Local job generation and task-form handoff, with no credentials or network."""
+"""Local development/native job generation, with no credentials or network."""
 import json
 import os
 from pathlib import Path
@@ -22,6 +22,7 @@ class JobTests(unittest.TestCase):
         self.script = self.root / 'my script.py'
         self.script.write_text("print('example')\n")
         self.profile = {
+            'account': 'sample_user',
             'remote_python': '/sample_user/envs/project/bin/python',
             'persistent_root': '/sample_user/runs',
             'max_environment_seconds': 14400,
@@ -101,14 +102,70 @@ class JobTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.local_job(downloads=[['only-one-value']])
 
-    def test_training_is_explicitly_non_executable_and_has_no_five_day_assumption(self):
-        job = self.local_job(purpose='training', minutes=10000)
-        self.assertEqual(job['backend'], 'native-guide')
-        self.assertIs(job['executable'], False)
+    def test_training_is_executable_native_and_has_no_development_or_five_day_cap(self):
+        from native import prepare_task_spec
+        job = create_job(self.profile, remote_script='/sample_user/project/train.py',
+                         purpose='training', minutes=10000, argv=['--output', '{run_dir}/result.json'])
+        self.assertEqual(job['backend'], 'native')
+        self.assertIsNot(job.get('executable'), False)
         self.assertEqual(job['purpose'], 'training')
         self.assertEqual(job['max_seconds'], 600000)
         self.assertEqual(job['resource_group_id'], self.profile['training_group_id'])
-        self.assertNotIn('ready_timeout', job)
+        self.assertEqual(job['image'], self.profile['image'])
+        self.assertEqual(job['card_type'], self.profile['card_type'])
+        self.assertEqual(job['argv'][0], self.profile['remote_python'])
+        self.assertEqual(job['argv'][-1], job['run_dir'] + '/result.json')
+        self.assertEqual(job['uploads'], [])
+        self.assertEqual(job['nodes'], 1)
+        self.assertIsNone(job['group_max_seconds'])
+        self.assertEqual(prepare_task_spec(job, self.profile), job)
+        for field in ('ready_timeout', 'preparation_seconds', 'collection_seconds', 'cleanup_seconds'):
+            self.assertNotIn(field, job)
+
+    def test_training_local_script_requires_explicit_persistent_staging(self):
+        with self.assertRaisesRegex(ValueError, 'Stage.*persistent storage.*remote_script'):
+            self.local_job(purpose='training')
+
+    def test_training_download_requests_are_rejected_instead_of_ignored(self):
+        with self.assertRaisesRegex(ValueError, 'remain in persistent storage.*not supported'):
+            create_job(self.profile, remote_script='/sample_user/project/train.py',
+                       purpose='training', downloads=[('{run_dir}/result.json', self.root / 'result.json')])
+
+    def test_single_node_multi_gpu_allowed_and_multi_node_rejected(self):
+        job = create_job(self.profile, remote_script='/sample_user/project/train.py',
+                         purpose='training', nodes=1, gpus=4, cpus=48, max_seconds=86400)
+        self.assertEqual((job['nodes'], job['gpus'], job['cpus']), (1, 4, 48))
+        self.assertEqual(job['max_seconds'], 86400)
+        for nodes in (0, 2, True, 1.0):
+            with self.subTest(nodes=nodes), self.assertRaisesRegex(ValueError, 'one node'):
+                create_job(self.profile, remote_script='/sample_user/project/train.py',
+                           purpose='training', nodes=nodes)
+
+    def test_training_never_borrows_development_group(self):
+        profile = dict(self.profile, development_group_id='development-only')
+        profile.pop('training_group_id')
+        with self.assertRaisesRegex(ValueError, 'training resource_group_id'):
+            create_job(profile, remote_script='/sample_user/project/train.py', purpose='training')
+
+    def test_training_requires_image_and_gpu_model_from_profile(self):
+        for field in ('image', 'card_type'):
+            profile = dict(self.profile)
+            profile.pop(field)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                create_job(profile, remote_script='/sample_user/project/train.py', purpose='training')
+        profile = dict(self.profile)
+        profile.pop('card_type')
+        job = create_job(profile, remote_script='/sample_user/project/cpu.py', purpose='training', gpus=0)
+        self.assertEqual(job['card_type'], '')
+
+    def test_explicit_seconds_are_unambiguous_and_validated(self):
+        job = self.local_job(max_seconds=6)
+        self.assertEqual(job['max_seconds'], 6)
+        for seconds in (0, -1, True, 1.5):
+            with self.subTest(seconds=seconds), self.assertRaises(ValueError):
+                self.local_job(max_seconds=seconds)
+        with self.assertRaisesRegex(ValueError, 'not both'):
+            self.local_job(minutes=1, max_seconds=60)
 
     def test_exclusive_json_is_private_and_never_overwrites(self):
         target = self.root / 'private' / 'job.json'
@@ -140,13 +197,14 @@ class JobTests(unittest.TestCase):
         self.assertFalse(other.exists())
 
     def test_task_guide_has_expanded_absolute_command_and_manual_handoff(self):
-        job = self.local_job(run_id='review_job', purpose='training', argv=['--label', 'a b'],
-                             downloads=[('{run_dir}/result.json', self.root / 'result.json')])
+        job = create_job(self.profile, remote_script='/sample_user/project/my script.py',
+                         run_id='review_job', purpose='training',
+                         argv=['--label', 'a b', '--output', '{run_dir}/result.json'])
         guide = render_task_guide(job, self.profile)
         self.assertIn('不是平台 JSON 导入文件', guide)
         self.assertIn('不是可提交的原生训练 API 请求', guide)
         self.assertIn('example-training-group', guide)
-        self.assertIn("'/sample_user/runs/review_job/my script.py'", guide)
+        self.assertIn("'/sample_user/project/my script.py'", guide)
         self.assertIn("--label 'a b'", guide)
         self.assertIn('/sample_user/runs/review_job/result.json', guide)
         self.assertNotIn('{run_dir}', guide)

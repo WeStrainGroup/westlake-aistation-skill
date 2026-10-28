@@ -1,4 +1,4 @@
 interface:
   display_name: "Westlake AIStation"
-  short_description: "Run bounded GPU jobs with shared monitoring and cleanup"
+  short_description: "Plan AIStation compute and verify resources, monitoring and cleanup"
   default_prompt: "Use $westlake-aistation to plan and run my GPU job on my configured AIStation account."

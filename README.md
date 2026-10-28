@@ -1,27 +1,28 @@
 # Westlake AIStation Skill
 
-按西湖大学 AIStation 手册组织开发调试、资源检查、短任务运行和正式训练准备。支持命令行，也可作为 Codex Skill 使用；每个人使用自己的账号和连接配置。
+按西湖大学 AIStation 手册组织开发调试、资源检查、短任务运行和正式训练准备和原生接口诊断。支持命令行，也可作为 Codex Skill 使用；每个人使用自己的账号和连接配置。
 
 Community CLI and Codex skill. This is not an official university SDK, and the manual does not promise compatibility with these observed API endpoints.
 
-**预览版 `v0.2.0-preview.2`：公开改版尚未取得实机 GPU 全流程 PASS。此前检查通过了资源申请和实际 V100 型号核验，但共享目录创建超时；测试资源已释放。自动测试通过不能替代自己部署的小任务验证。**
+**预览版 `v0.2.0-preview.3`：公开改版尚未取得实机 GPU 全流程 PASS。此前检查通过了资源申请和实际 V100 型号核验，但共享目录创建超时；测试资源已释放。自动测试通过不能替代自己部署的小任务验证。**
 
 ## 安装
 
 需要 macOS 或 Linux、Python 3.11+，以及可访问目标 AIStation 的网络。远端镜像需提供 Python 3、SSH/SFTP、`timeout` 和 `sha256sum`；Windows 原生运行尚不支持。
 
 ```bash
-git clone https://github.com/WeStrainGroup/westlake-aistation-skill.git \
-  ~/.codex/skills/westlake-aistation
-cd ~/.codex/skills/westlake-aistation
+git clone https://github.com/WeStrainGroup/westlake-aistation-skill.git
+cd westlake-aistation-skill
 python3 -m venv scripts/.venv
 scripts/.venv/bin/python -m pip install -r scripts/requirements.txt
-scripts/wlai --help
+scripts/.venv/bin/python scripts/install_local.py \
+  --runtime-python "$PWD/scripts/.venv/bin/python"
+~/.codex/skills/westlake-aistation/scripts/wlai --version
 ```
 
-已有同名技能时先比较版本，不覆盖自己的安装。也可克隆到其他目录作为普通 CLI；`WLAI_PYTHON` 可指定已有解释器。
+安装器保存不可变版本并原子切换本机 skill，保留私有配置。普通 CLI 也可直接使用源码目录的 `scripts/wlai`。已有旧 CLI 入口时，用 `--cli-path /absolute/old/wlai` 同步该入口；只替换并备份入口文件，不改动旁边的配置、证书、数据和状态。`--profile`、`--state-root` 可设置包装器的默认私有配置与共享状态根目录，不读取或复制凭据。
 
-从 `v0.1` 升级前，先用旧版完成或停止活动任务并保存回执。新版本增加了计划预算字段，旧计划的指纹不做静默迁移；新任务使用新的运行 ID。
+**每次 GitHub 更新后，都要安装同一提交并核对本机版本。** 不在运行中的控制器代码目录内 `git pull`。升级、版本核验与回滚命令见 [使用参考](references/usage.md#installation-and-updates)。旧完整源码安装的迁移需要先结束旧控制器；安装器默认拒绝直接热改。
 
 ## 首次配置
 
@@ -72,12 +73,24 @@ scripts/wlai watch --run-id RUN_ID
 
 手册的正常流程是先在开发环境调试，再到“业务管理 → 任务管理”提交正式任务。开发环境统一最长四小时；正式任务时限取决于资源组，许多组为五天，应使用 checkpoint。[官方任务说明](https://hpc.westlake.edu.cn/document/ai/aistation/6.task.html)
 
+先把调试通过的代码、环境和数据一次性放入已核验的持久目录，再生成原生任务计划：
+
 ```bash
-scripts/wlai job --purpose training --script ./train.py --minutes 30 --out training-job.json
-scripts/wlai task-guide --spec training-job.json --out task-guide.md
+scripts/wlai groups --purpose training
+scripts/wlai configure --purpose training
+scripts/wlai job --purpose training --remote-script /personal/train.py \
+  --minutes 1440 --out training-job.json -- --output '{run_dir}/results'
+scripts/wlai task-plan --spec training-job.json
+scripts/wlai task-plan --spec training-job.json --online
 ```
 
-这两条命令只生成作业说明和网页填写清单，**不会提交训练任务**。按导出的清单在平台核对资源组、时限、镜像、数据挂载、绝对命令和输出路径后提交。原生训练 GPU API 尚未通过兼容性验证，仍禁用；本工具不把开发环境当作长训练的替代后端。
+这几条命令不提交任务。命令长度受部署限制；若内嵌检查器被平台拒绝，可预置同版本检查器并通过 SHA-256 校验后用短命令启动，见 [原生任务参考](references/usage.md#native-task-management-plan-and-bounded-diagnostics)。
+
+原生任务有独立注册表与 `task-status/task-logs/task-watch/task-stop/task-reconcile`；无需开发环境 SSH。`task-watch` 的超时只停止本机观察，不取消平台任务。输出留在持久盘，当前不会自动下载；多节点 DDP 和批量派发尚未实现。
+
+**当前原生 GPU 创建仍不满足生产上线条件。** 本轮通过官方表单精确转发的 1 GPU 请求也被服务端改成 CPU/0 GPU，CUDA 验证失败。默认 `task-submit --spec training-job.json --execute` 会拒绝新增原生任务；仅已获授权的小型诊断可显式使用 `--experimental-native`。客户端核对平台回读资源，发现不符会停止本次新任务；容器内 guard 还会验证真实 GPU 和持久挂载，未通过就不启动科学代码。不能凭“创建成功”宣称申请到了 GPU。
+
+`task-guide --spec training-job.json --out task-guide.md` 仍可导出人工网页清单。网页提交也必须核验实际硬件。当前限制不能通过把长训练转到开发环境来规避。生产批次应等待此部署的 GPU 实测通过；不要为测试重复投递正式训练。
 
 ## 挂载与传输检查
 

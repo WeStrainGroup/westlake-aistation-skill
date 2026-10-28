@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Portable JSON CLI for bounded AIStation development-environment jobs."""
+"""Portable JSON CLI for AIStation debugging environments and native training tasks."""
 import argparse
 import getpass
 import json
@@ -11,7 +11,7 @@ import tempfile
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument('--version', action='version', version='westlake-aistation 0.2.0-preview.2')
+    root.add_argument('--version', action='version', version='westlake-aistation 0.2.0-preview.3')
     root.add_argument('--profile', type=Path, help='Private, nonsecret connection profile')
     root.add_argument('--state-dir', type=Path, help='Override the account-scoped run registry')
     root.add_argument('--non-interactive', action='store_true', help='Never prompt for a password')
@@ -24,7 +24,8 @@ def parser():
     init.add_argument('--server-cert', type=Path, help='One independently trusted server PEM; derives its SHA-256 pin locally')
     init.add_argument('--storage', choices=('master', 'ssdwork'), default='master')
     configure = commands.add_parser('configure', help='Complete or update your nonsecret execution settings')
-    configure.add_argument('--group-id', dest='development_group_id')
+    configure.add_argument('--purpose', choices=('development', 'training'), default='development')
+    configure.add_argument('--group-id', help='Group ID for the selected purpose')
     configure.add_argument('--image')
     configure.add_argument('--gpu-model', dest='card_type')
     configure.add_argument('--ssh-fingerprint', dest='ssh_host_fingerprint')
@@ -68,7 +69,33 @@ def parser():
     create.add_argument('--cpus', type=int, default=12)
     create.add_argument('--gpus', type=int, default=1)
     create.add_argument('--ready-timeout', type=int, default=150)
+    group = create.add_mutually_exclusive_group()
+    group.add_argument('--group-id')
+    group.add_argument('--group-name')
+    create.add_argument('--gpu-model')
     create.add_argument('--execute', action='store_true')
+    groups = commands.add_parser('groups', help='List groups actually authorized for the selected workload')
+    groups.add_argument('--purpose', choices=('development', 'training'), default='training')
+    groups.add_argument('--format', choices=('json', 'table'), default='table')
+    for name in ('task-plan', 'task-submit'):
+        task = commands.add_parser(name, help='Platform-owned native training task')
+        task.add_argument('--spec', type=Path, required=True)
+        if name == 'task-plan':
+            task.add_argument('--online', action='store_true')
+        else:
+            task.add_argument('--execute', action='store_true')
+            task.add_argument('--queue', action='store_true', help='Explicitly allow a compatible busy group to queue')
+            task.add_argument('--experimental-native', action='store_true',
+                              help='Diagnostic opt-in for an unverified native API; never implies production readiness')
+    commands.add_parser('task-runs', help='Read native task records without authentication')
+    for name in ('task-status', 'task-logs', 'task-stop', 'task-reconcile', 'task-watch'):
+        task = commands.add_parser(name)
+        task.add_argument('--run-id', required=True)
+        if name == 'task-status':
+            task.add_argument('--cached', action='store_true')
+        if name == 'task-watch':
+            task.add_argument('--interval', type=float, default=5)
+            task.add_argument('--timeout', type=float, default=600, help='Local observing timeout; platform task continues')
     for name in ('status', 'watch', 'stop', 'reconcile', 'collect', 'logs', 'metrics', 'exec', 'put', 'get', 'storage-check'):
         command = commands.add_parser(name)
         command.add_argument('--run-id', required=True)
@@ -120,10 +147,13 @@ def initialize(args):
             'next': 'login --remember; resources --group all --format table; configure'}
 
 
-def _execution_prompts(current):
-    fields = [('development_group_id', 'Development resource group ID (see resources --group all)'),
-              ('image', 'Container image'), ('card_type', 'GPU model (blank for CPU-only)'),
-              ('ssh_host_fingerprint', 'Independently verified container SSH fingerprint (SHA256:...)')]
+def _execution_prompts(current, purpose='development'):
+    fields = [('training_group_id' if purpose == 'training' else 'development_group_id',
+               'Training resource group ID (see groups --purpose training)' if purpose == 'training'
+               else 'Development resource group ID (see groups --purpose development)'),
+              ('image', 'Container image'), ('card_type', 'GPU model (blank for CPU-only)')]
+    if purpose == 'development':
+        fields.append(('ssh_host_fingerprint', 'Independently verified container SSH fingerprint (SHA256:...)'))
     result = {}
     for key, label in fields:
         default = current.get(key, '')
@@ -147,16 +177,23 @@ def configure_profile(args):
     fields = ('development_group_id', 'image', 'card_type', 'ssh_host_fingerprint', 'remote_python',
               'storage', 'storage_mount', 'persistent_root', 'training_group_id')
     changes = {key: getattr(args, key) for key in fields if getattr(args, key, None) is not None}
+    if args.group_id is not None:
+        key = 'training_group_id' if args.purpose == 'training' else 'development_group_id'
+        if key in changes and changes[key] != args.group_id:
+            raise ValueError('Conflicting resource group IDs')
+        changes[key] = args.group_id
     if not changes:
         if args.non_interactive or not sys.stdin.isatty():
             raise RuntimeError('Supply configure flags, or use an interactive terminal')
-        changes = _execution_prompts(values)
+        changes = _execution_prompts(values, args.purpose)
     if 'storage' in changes and changes['storage'] != values.get('storage'):
         values.pop('storage_mount', None); values.pop('persistent_root', None)
     values.update(changes)
-    profile = validate_profile(values, target.parent, require_execution=True)
+    profile = validate_profile(values, target.parent, require_execution=args.purpose == 'development')
+    if args.purpose == 'training' and (not profile.get('training_group_id') or not profile.get('image')):
+        raise ValueError('Training configuration requires --training-group-id and --image; use groups --purpose training to discover groups')
     write_profile(target, profile, replace=True)
-    return {'configured': True, 'execution_ready': True, 'profile': str(target), 'storage': profile['storage'],
+    return {'configured': True, 'purpose': args.purpose, 'execution_ready': True, 'profile': str(target), 'storage': profile['storage'],
             'persistent_root': profile['persistent_root'], 'data_moved': False, 'password_saved': False}
 
 
@@ -175,6 +212,19 @@ def resource_table(nodes):
     return '\n'.join(lines)
 
 
+def group_table(groups):
+    return '\n'.join(f"{group.get('groupName', '')} | label={group.get('groupLabel', '')} | id={group.get('groupId', '')} | models={','.join(group.get('cardTypeList') or [])}" for group in groups) or 'No groups are authorized for this workload.'
+
+
+def error_details(error):
+    result = {'error': type(error).__name__, 'message': str(error)}
+    for attribute in ('code', 'operation', 'method', 'safe_server_message', 'cleanup_error'):
+        value = getattr(error, attribute, None)
+        if value:
+            result[attribute] = value
+    return result
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if args.command == 'init':
@@ -185,7 +235,36 @@ def main(argv=None):
         from config import execution_requirements, load_profile, state_directory
         execution_commands = {'plan', 'run', 'submit', 'env-create', 'exec', 'put', 'get', 'metrics', 'storage-check'}
         profile = load_profile(args.profile, require_execution=args.command in execution_commands)
-        if args.command == 'job':
+        if args.command.startswith('task-') and args.command != 'task-guide':
+            from native import NativeTasks, prepare_task_spec
+            tasks = NativeTasks(profile=profile, state_dir=args.state_dir, interactive=not args.non_interactive)
+            try:
+                if args.command == 'task-runs':
+                    result = tasks.registry.list()
+                elif args.command in ('task-plan', 'task-submit'):
+                    spec = prepare_task_spec(json.loads(args.spec.read_text()), profile)
+                    result = tasks.plan(spec, online=args.online) if args.command == 'task-plan' else tasks.submit(
+                        spec, execute=args.execute, allow_queue=args.queue, experimental=args.experimental_native)
+                elif args.command == 'task-status':
+                    result = tasks.status(args.run_id, refresh=not args.cached)
+                elif args.command == 'task-logs':
+                    result = tasks.logs(args.run_id)
+                elif args.command == 'task-stop':
+                    result = tasks.stop(args.run_id)
+                elif args.command == 'task-reconcile':
+                    result = tasks.reconcile(args.run_id)
+                else:
+                    result = tasks.watch(args.run_id, interval=args.interval, timeout=args.timeout)
+            finally:
+                tasks.close()
+        elif args.command == 'groups':
+            from cluster import Cluster
+            cluster = Cluster(profile=profile, interactive=not args.non_interactive)
+            try:
+                result = cluster.groups(args.purpose)
+            finally:
+                cluster.close()
+        elif args.command == 'job':
             from jobs import create_job, write_json_exclusive
             command_args = args.argv[1:] if args.argv and args.argv[0] == '--' else args.argv
             spec = create_job(profile, script=args.script, remote_script=args.remote_script, run_id=args.run_id,
@@ -193,7 +272,7 @@ def main(argv=None):
                               argv=command_args, purpose=args.purpose)
             write_json_exclusive(args.out, spec)
             result = {'written': str(args.out.resolve()), 'run_id': spec['run_id'], 'purpose': args.purpose,
-                      'submitted': False, 'next': 'task-guide' if args.purpose == 'training' else 'plan'}
+                      'submitted': False, 'next': 'task-plan' if args.purpose == 'training' else 'plan'}
         elif args.command == 'task-guide':
             from jobs import render_task_guide
             text = render_task_guide(json.loads(args.spec.read_text()), profile)
@@ -210,7 +289,7 @@ def main(argv=None):
             finally:
                 if temporary:
                     temporary.unlink(missing_ok=True)
-            result = {'written': str(target), 'submitted': False, 'native_api_enabled': False}
+            result = {'written': str(target), 'submitted': False, 'format': 'manual_form_checklist'}
         elif args.command == 'runs':
             from registry import Registry, profile_identity
             result = Registry(args.state_dir or state_directory(profile), profile_identity(profile)).list()
@@ -276,17 +355,37 @@ def main(argv=None):
                         raise RuntimeError('Background submit requires a system credential store; run login --remember, or use foreground run')
                     result = cluster.submit(spec)
             elif args.command == 'env-create':
-                spec = prepare_spec({'run_id': args.run_id, 'argv': ['/bin/true'],
+                source = {'run_id': args.run_id, 'argv': ['/bin/true'],
                                      'cpus': args.cpus, 'gpus': args.gpus,
-                                     'ready_timeout': args.ready_timeout}, profile)
+                                     'ready_timeout': args.ready_timeout}
+                if args.group_name:
+                    matches = [group for group in cluster.groups('development') if group.get('groupName') == args.group_name]
+                    if len(matches) != 1:
+                        raise ValueError('Development group name is unavailable or ambiguous; inspect groups --purpose development')
+                    source['resource_group_id'] = matches[0]['groupId']
+                    models = matches[0].get('cardTypeList') or []
+                    if len(models) == 1:
+                        source['card_type'] = models[0]
+                if args.group_id:
+                    source['resource_group_id'] = args.group_id
+                if args.gpu_model:
+                    source['card_type'] = args.gpu_model
+                spec = prepare_spec(source, profile)
                 result = cluster.plan(spec)
                 if args.execute:
                     try:
                         cluster.create_environment(args.run_id)
                         result = cluster.wait_environment(args.run_id)
-                    except BaseException:
+                    except BaseException as error:
                         if cluster.registry.get(args.run_id).get('resource_id'):
-                            cluster.stop_environment(args.run_id)
+                            try:
+                                cluster.stop_environment(args.run_id)
+                            except Exception as cleanup:
+                                from cluster import safe_error
+                                error.cleanup_error = safe_error(cleanup)
+                                cluster.registry.update(args.run_id, cleanup_failure=error.cleanup_error)
+                        from cluster import safe_error
+                        cluster.registry.update(args.run_id, failure=safe_error(error))
                         raise
             elif args.command == 'status':
                 result = cluster.registry.get(args.run_id)
@@ -337,9 +436,11 @@ def main(argv=None):
                 result = cluster.client.task_log(args.id)
     if args.command == 'resources' and args.format == 'table':
         print(resource_table(result))
+    elif args.command == 'groups' and args.format == 'table':
+        print(group_table(result))
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    if isinstance(result, dict) and result.get('state') in ('FAILED', 'TIMED_OUT', 'BLOCKED', 'COLLECTION_FAILED', 'UNKNOWN'):
+    if isinstance(result, dict) and result.get('state') in ('FAILED', 'TIMED_OUT', 'BLOCKED', 'COLLECTION_FAILED', 'UNKNOWN', 'RESOURCE_MISMATCH', 'DELETED', 'COMPLETED_UNVERIFIED'):
         return 2
     if isinstance(result, dict) and result.get('missing_dependencies'):
         return 1
@@ -350,5 +451,5 @@ if __name__ == '__main__':
     try:
         raise SystemExit(main())
     except (Exception, KeyboardInterrupt) as error:
-        print(json.dumps({'error': type(error).__name__, 'message': str(error)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(error_details(error), ensure_ascii=False), file=sys.stderr)
         raise SystemExit(1)

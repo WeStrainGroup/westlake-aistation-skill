@@ -1,10 +1,43 @@
 # Setup, jobs and recovery
 
-When upgrading from v0.1, finish or stop active controllers with that version first and preserve their receipts. New preparation/collection budgets participate in the immutable plan fingerprint. Existing plans are not silently rewritten; create a new run ID for new work.
+## Installation and updates
+
+Keep a source checkout separate from the discoverable skill directory. Install an immutable snapshot with the Python environment containing the requirements:
+
+```bash
+python3 -m venv scripts/.venv
+scripts/.venv/bin/python -m pip install -r scripts/requirements.txt
+scripts/.venv/bin/python scripts/install_local.py \
+  --runtime-python "$PWD/scripts/.venv/bin/python"
+```
+
+The default destination is `$CODEX_HOME/skills/westlake-aistation` (or `~/.codex/skills/...`), with immutable source versions under `skill-versions`. Optional `--cli-path /absolute/old/wlai` replaces and backs up only that legacy entrypoint. `--profile /private/profile.json` and `--state-root /private/shared-state` configure default wrapper paths without reading or copying profiles, credentials or state; explicit environment values still take precedence. Default state remains account-scoped even with `WLAI_STATE_ROOT`.
+
+After **every GitHub release**, update this local installation and all known canonical CLI entrypoints from the same reviewed commit:
+
+```bash
+wlai_source=/absolute/separate/westlake-aistation-skill
+cd "$wlai_source"
+git status --short
+git fetch --tags
+git checkout --detach REVIEWED_COMMIT
+"$wlai_source/scripts/.venv/bin/python" "$wlai_source/scripts/install_local.py" \
+  --runtime-python "$wlai_source/scripts/.venv/bin/python" \
+  --cli-path /absolute/old/wlai --profile /private/profile.json \
+  --state-root /private/shared-state
+~/.codex/skills/westlake-aistation/scripts/wlai --version
+/absolute/old/wlai --version
+```
+
+Run these update commands from the separate source checkout, never from the installed wrapper directory. The installer rejects a Git checkout with tracked changes or untracked files; resolve them without discarding user work. The content hash identifies the installed publishable file set, while the revision identifies the reviewed clean commit.
+
+Read `~/.codex/skills/westlake-aistation/INSTALLATION.json` and confirm its `revision` matches the release commit and its `source_version` matches both entrypoints. Keep that installation result with the release verification. The installer is local: publishing on GitHub alone cannot update another machine. Other agents should reread the installed skill before their next operation; already loaded conversation instructions do not refresh themselves.
+
+Snapshots and wrappers allow existing controllers to keep using their original code. Do not `git pull` inside a running controller's source directory. A legacy full-source skill directory needs its controllers finished/stopped before `--allow-legacy-migration`; wrapper-only installations can switch without modifying their private data. Previous wrappers and unknown files are backed up outside the discoverable skills directory. To roll back, rerun the installer with `--source-dir /absolute/previous/version` and the same installation options. Preserve profile/certificates/credential stores and run receipts; do not migrate unscoped legacy state automatically.
 
 ## Connection first, execution settings second
 
-Default profile: `$XDG_CONFIG_HOME/westlake-aistation/profile.json`, or `~/.config/westlake-aistation/profile.json`. Global `--profile FILE` or `WLAI_PROFILE` selects another file. Paths to a CA/certificate resolve relative to that profile. The profile contains connection metadata, never passwords or tokens. State is isolated by portal/account under `$XDG_STATE_HOME`, or `~/.local/state`; use a local POSIX filesystem with locks and atomic rename.
+Default profile: `$XDG_CONFIG_HOME/westlake-aistation/profile.json`, or `~/.config/westlake-aistation/profile.json`. Global `--profile FILE` or `WLAI_PROFILE` selects another file. Paths to a CA/certificate resolve relative to that profile. The profile contains connection metadata, never passwords or tokens. State is isolated by portal/account under `$WLAI_STATE_ROOT` when set, otherwise `$XDG_STATE_HOME/westlake-aistation` or `~/.local/state/westlake-aistation`; use a local POSIX filesystem with locks and atomic rename.
 
 ```bash
 scripts/wlai init --connection-only --server-cert /absolute/trusted-server.pem
@@ -59,14 +92,46 @@ Requested downloads are explicit:
 
 Hashes are verified during transfer; different existing local files are not replaced. Changing parameters or script contents requires a new run ID. Specs and program logs persist locally for reproducibility: never put API passwords or other secrets in script arguments, code, filenames or output logs.
 
-## Formal training: export a web-submission guide
+## Native task management: plan and bounded diagnostics
+
+Formal training belongs in task management after debugging. Code, inputs and environments must already be on the selected persistent mount; native tasks do not use a development container for uploads. Use absolute image/personal-environment interpreters and scripts. Configure training without requiring a development SSH fingerprint:
 
 ```bash
-scripts/wlai job --purpose training --script ./train.py --minutes 30 --out training-job.json
-scripts/wlai task-guide --spec training-job.json --out task-guide.md
+scripts/wlai groups --purpose training
+scripts/wlai configure --purpose training
+scripts/wlai job --purpose training --remote-script /personal/train.py \
+  --minutes 1440 --out training-job.json -- --output '{run_dir}/results'
+scripts/wlai task-plan --spec training-job.json
+scripts/wlai task-plan --spec training-job.json --online
 ```
 
-These commands generate a spec and Markdown checklist only. They do not request resources or submit a native training task. Use the checklist in the platform's task-management form to review resource group, group-specific runtime, image, mount, absolute command, logs, checkpoint and result paths. Training limits vary; many groups allow five days. Do not assume that limit applies to every group or that a successful browser submission proves correct output. Native training GPU API compatibility remains unresolved, so `run/submit` must not silently turn a training plan into a development-environment run.
+The job is a native spec, not a platform JSON import. `task-plan` does not submit; online planning checks training labels (`usual,train`) and same-node capacity. `groups --purpose development` uses `develop,usual`. Node visibility does not establish workload permission, current quota or a reservation. One node may request multiple GPUs. The generator starts one `python -u` process; it does not configure torchrun, a distributed backend or rank variables. Confirm that the program uses all requested GPUs, or explicitly review a launcher command in `spec.argv`. Independent tasks are not multi-node DDP. This preview has no batch dispatcher.
+
+**New native submissions remain experimental.** A live request made by the official form was accepted but normalized to CPU/zero GPU. The root cause on this deployment is unresolved. Default `task-submit --spec FILE --execute` refuses creation. Only an authorized, bounded diagnostic may use `--experimental-native`; this opt-in is not evidence of production support. `--queue` additionally permits a compatible busy group to queue; it does not permit an impossible single-node request. Unknown creation outcomes must be reconciled, never blindly retried.
+
+The default submitted command embeds a compressed standard-library startup guard. Some deployments reject even that command with `IRESOURCE_STRING_LENGTH_ILLEGAL`. In that case, stage the exact `scripts/native_runner.py` from the reviewed source checkout in verified personal persistent storage once, and add `guard_script` (its absolute remote path) to the spec. `guard_script_sha256` is fixed to the bundled source SHA-256; an explicitly different value is rejected. The short launcher reads that file and verifies its bytes before executing it. Use versioned/hash-named paths, preserve guards referenced by queued/running tasks, and never overwrite an active guard during upgrade. This staging is explicit; native submission does not allocate a debugging environment or upload files for you.
+
+For long argument lists, also set an absolute personal `guard_manifest` path. The plan then reports `guard_mode=staged-files`, `guard_manifest_content` and `guard_manifest_sha256`. Before submitting, write the content as `json.dumps(content, sort_keys=True, separators=(',', ':')).encode('utf-8')` with **no trailing newline**, verify the reported SHA-256, and stage those bytes at `guard_manifest`. The short launcher verifies both complete files before loading the runner. Keep each manifest immutable for its queued/running task; after changing arguments use a new run ID and manifest path.
+
+`task-plan` reports `guard_mode`, `guard_script_sha256` and `command_bytes`. Optional positive `command_max_bytes` enforces a locally configured deployment limit before any API call; the client does not guess a universal server limit.
+
+The startup guard checks the real persistent mount and GPU count/model before starting user code, keeps separate attempt receipts in `{run_dir}/attempts`, and bounds the program with an independent timer. Project-specific environment variables belong in `spec.env`; the client does not set framework compatibility workarounds globally. The command/request snapshot is saved for reconciliation after a client upgrade. A submitted GPU resource mismatch stops only the newly created task; observers report evidence and do not silently submit replacement work.
+
+A platform `Succeeded` without a matching successful terminal guard receipt becomes `COMPLETED_UNVERIFIED`. Multiple unbound attempts cannot establish a unique successful run. Guard success validates execution infrastructure, not scientific output; validate expected metrics/checkpoints separately. `resource_released` for native tasks records platform terminal status as its evidence, not an independent physical cluster-usage measurement.
+
+`task-runs` is local; other commands use the recorded task identity and owner:
+
+```bash
+scripts/wlai task-status --run-id RUN_ID
+scripts/wlai task-logs --run-id RUN_ID
+scripts/wlai task-watch --run-id RUN_ID --timeout 600
+scripts/wlai task-reconcile --run-id RUN_ID
+scripts/wlai task-stop --run-id RUN_ID
+```
+
+Once accepted, the platform runs the task independently of the client machine. A local watch timeout does not cancel it. Outputs stay on persistent storage; native automatic downloads are not implemented. The guard's program budget does not override group policies: verify the group's actual lifetime, optionally set `group_max_seconds`, and include guard/receipt allowances. Do not assume every group allows five days. Checkpoint/resume belongs to the scientific program.
+
+`task-guide --spec FILE --out FILE` still exports a manual web-form checklist only. Its direct science command does not include the native guard or hard timeout; prepare and review those separately before a manual submission. Manual submission also requires actual GPU and output verification. Do not replace long training with successive four-hour debugging environments to bypass the unsupported native interface.
 
 ## Commands
 
@@ -74,12 +139,18 @@ These commands generate a spec and Markdown checklist only. They do not request 
 | --- | --- |
 | `init [--connection-only] [--server-cert FILE]` | Create personal configuration; no password is saved |
 | `login [--remember]` | Verify hidden credentials; optionally use the system credential store |
-| `configure` | Complete execution settings after connection/resource discovery |
+| `configure --purpose development|training` | Complete the selected workload settings; training needs no development SSH setup |
 | `doctor [--online]` | Check local setup; online mode reads resources without allocating |
 | `resources --group all --format table` | Discover accessible group IDs, models and node capacity |
 | `job --script FILE --minutes N --out FILE -- ...` | Generate a debugging spec from a script and arguments |
 | `plan --spec FILE [--online]` | Offline plan by default; optional live resource query |
-| `task-guide --spec FILE --out FILE` | Export formal-training web-form instructions without submitting |
+| `groups --purpose development|training` | List workload-authorized resource groups |
+| `task-plan --spec FILE [--online]` | Inspect a staged native task without submitting |
+| `task-submit --spec FILE --execute --experimental-native` | Explicit bounded diagnostic; native compatibility remains unverified |
+| `task-runs` / `task-status --run-id ID [--cached]` | Native registry or current task observation |
+| `task-logs/task-watch --run-id ID` | Native logs/read-only monitoring; local timeout does not cancel |
+| `task-stop/task-reconcile --run-id ID` | Stop this task or reconcile an uncertain creation |
+| `task-guide --spec FILE --out FILE` | Export manual web-form instructions without submitting |
 | `run/submit --spec FILE --execute` | Foreground/background development controller |
 | `runs` | Local shared records without authentication |
 | `status --run-id ID [--refresh]` | Read state; released runs use local records unless refresh is requested |

@@ -1,4 +1,4 @@
-"""Local job preparation and reviewable handoff to the AIStation task form."""
+"""Local job preparation for development environments and staged native tasks."""
 import datetime
 import json
 import math
@@ -52,19 +52,38 @@ def _runtime_seconds(minutes):
 
 
 def create_job(profile, *, script=None, remote_script=None, run_id=None, cpus=12,
-               gpus=1, minutes=10, downloads=(), argv=(), purpose='development'):
-    """Build a raw spec locally; training specs are non-executable form guides."""
+               gpus=1, minutes=None, max_seconds=None, nodes=1, downloads=(), argv=(),
+               purpose='development'):
+    """Build a local spec; training uses staged persistent files and the native backend.
+
+    Use either minutes or max_seconds. With neither provided, the program budget
+    is ten minutes. This generator supports exactly one node, including multiple
+    GPUs on that node; it does not construct a distributed launcher.
+    """
     if purpose not in ('development', 'training'):
         raise ValueError('purpose must be development or training')
     if (script is None) == (remote_script is None):
         raise ValueError('Choose exactly one local script or absolute remote script')
+    if type(nodes) is not int or nodes != 1:
+        raise ValueError('Only one node per task is supported; independent tasks are not multi-node DDP')
+    if purpose == 'training' and script is not None:
+        raise ValueError('Stage the production script and inputs in verified persistent storage first, then use remote_script; training does not upload local files or fall back to a development environment')
+    if purpose == 'training' and downloads:
+        raise ValueError('Native training outputs remain in persistent storage; automatic downloads are not supported, so collect them separately after validating task completion')
     if type(cpus) is not int or not 1 <= cpus <= 500:
         raise ValueError('cpus must be an integer from 1 to 500')
     if type(gpus) is not int or not 0 <= gpus <= 25:
         raise ValueError('gpus must be an integer from 0 to 25')
     if not isinstance(argv, (list, tuple)) or not all(isinstance(item, str) and '\x00' not in item for item in argv):
         raise ValueError('argv must be a list of program arguments without NUL characters')
-    seconds = _runtime_seconds(minutes)
+    if max_seconds is not None:
+        if minutes is not None:
+            raise ValueError('Choose minutes or max_seconds, not both')
+        if type(max_seconds) is not int or max_seconds < 1:
+            raise ValueError('max_seconds must be a positive integer')
+        seconds = max_seconds
+    else:
+        seconds = _runtime_seconds(10 if minutes is None else minutes)
     if purpose == 'development':
         limit = profile.get('max_environment_seconds', 14400)
         if type(limit) is not int or not 1 <= limit <= 14400:
@@ -104,7 +123,7 @@ def create_job(profile, *, script=None, remote_script=None, run_id=None, cpus=12
     result = {
         'run_id': _run_id(run_id),
         'purpose': purpose,
-        'backend': 'environment' if purpose == 'development' else 'native-guide',
+        'backend': 'environment' if purpose == 'development' else 'native',
         'cpus': cpus,
         'gpus': gpus,
         'max_seconds': seconds,
@@ -115,9 +134,15 @@ def create_job(profile, *, script=None, remote_script=None, run_id=None, cpus=12
     if purpose == 'development':
         result.update(_DEVELOPMENT_BUDGETS)
     else:
-        result['executable'] = False
-        if profile.get('training_group_id'):
-            result['resource_group_id'] = profile['training_group_id']
+        # The production interpreter belongs to the configured image or an
+        # already provisioned persistent environment. Never invent an upload or
+        # silently borrow a development-only resource group.
+        from native import prepare_task_spec
+        result.update(nodes=nodes, image=profile.get('image'),
+                      resource_group_id=profile.get('training_group_id'))
+        if gpus:
+            result['card_type'] = profile.get('card_type')
+        result = prepare_task_spec(result, profile)
     return result
 
 

@@ -16,13 +16,53 @@ import time
 from urllib.parse import urlencode, urlsplit
 
 
+_PLATFORM_CODE = re.compile(r"(?:IRESOURCE|IBASE|IIMAGE|ISTORAGE|COMMON)_[A-Z0-9_]+")
+_SAFE_PLATFORM_MESSAGES = {
+    "IRESOURCE_MAX_WOKR_PLATFORM_COUNT_EXCEED":
+        "The account's development-environment count limit was reached; inspect existing environments or use task management for production work.",
+    "IRESOURCE_MAX_WORK_PLATFORM_COUNT_EXCEED":
+        "The account's development-environment count limit was reached; inspect existing environments or use task management for production work.",
+    "IRESOURCE_INPUT_GPU_MORE_THAN_WORK_PLATFORM_CONFIG_LIMIT":
+        "The requested GPU count exceeds this development-environment configuration's limit.",
+    "IRESOURCE_CREATE_WORK_PLATFORM_RES_GROUP_NOT_MATCH_LABEL":
+        "The selected resource group's label does not support this development-environment request; inspect its supported workload type.",
+    "IRESOURCE_COMMON_RES_GROUP_CAN_NOT_BE_USED":
+        "The selected resource group is not compatible with this workload type.",
+    "IRESOURCE_DUPLICATED_ACCOUNT_MOUNT_PATH":
+        "The request duplicates a personal-directory mount already provided by the platform.",
+    "IRESOURCE_STRING_LENGTH_ILLEGAL":
+        "A request field exceeds the platform's length limit; inspect command_bytes and the deployment's documented limits before another diagnostic.",
+    "COMMON_PARAMETER_NOT_MATCH":
+        "The platform rejected a parameter; check the request schema for this deployment.",
+}
+
+
+def safe_platform_code(value):
+    """Retain only bounded vendor-style enums, never arbitrary response text."""
+    if isinstance(value, str) and len(value) <= 128 and _PLATFORM_CODE.fullmatch(value):
+        return value
+    return "PLATFORM_REJECTED"
+
+
+def _operation_path(value):
+    if not isinstance(value, str):
+        return None
+    path = value.partition('?')[0].partition('#')[0]
+    if not path.startswith('/api/') or any(ord(char) < 32 for char in path):
+        return None
+    return path
+
+
 class ApiError(RuntimeError):
-    def __init__(self, message, *, status=None, code=None, server_message=""):
+    def __init__(self, message, *, status=None, code=None, server_message="", operation=None, method=None):
         super().__init__(message)
         self.status = status
-        self.code = code
-        # Deliberately do not retain vendor error bodies, which can echo secrets.
-        self.server_message = ""
+        self.code = safe_platform_code(code) if code is not None else None
+        self.operation = _operation_path(operation)
+        self.method = method if method in ('GET', 'POST', 'PUT', 'DELETE', 'PATCH') else None
+        # Ignore raw vendor messages: even normal errors can echo request secrets.
+        self.safe_server_message = _SAFE_PLATFORM_MESSAGES.get(self.code, "")
+        self.server_message = self.safe_server_message
 
 
 class IdentityError(ssl.SSLError):
@@ -145,7 +185,7 @@ class AIStation:
                     attempt += 1
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise ApiError("Request deadline exhausted; no additional request sent")
+                        raise ApiError("Request deadline exhausted; no additional request sent", operation=path, method=method)
                     timeout = min(self.timeout, remaining)
                     try:
                         request_deadline = deadline
@@ -194,13 +234,16 @@ class AIStation:
                             if self._pause(attempt - 1, deadline):
                                 continue
                         if status != 200:
-                            raise ApiError(f"HTTP {status} at {path}; mutation requests are never replayed", status=status)
+                            raise ApiError(f"HTTP {status} at {path}; mutation requests are never replayed", status=status,
+                                           operation=path, method=method)
                         try:
                             data = json.loads(raw)
                         except (json.JSONDecodeError, UnicodeError):
-                            raise ApiError("Platform returned invalid JSON; body suppressed") from None
+                            raise ApiError("Platform returned invalid JSON; body suppressed", operation=path, method=method) from None
                         if not isinstance(data, dict) or not data.get("flag"):
-                            raise ApiError("Platform rejected request; response body suppressed", code="PLATFORM_REJECTED")
+                            code = safe_platform_code(data.get('errCode')) if isinstance(data, dict) else 'PLATFORM_REJECTED'
+                            message = 'Platform rejected request' if code == 'PLATFORM_REJECTED' else 'Platform rejected request: ' + code
+                            raise ApiError(message + '; response body suppressed', code=code, operation=path, method=method)
                         return data.get("resData")
                     except (OSError, http.client.HTTPException) as error:
                         self.close()
@@ -208,7 +251,15 @@ class AIStation:
                             continue
                         if isinstance(error, ssl.SSLError):
                             raise IdentityError("TLS identity validation failed; trust was not bypassed") from None
-                        raise ApiError("HTTP transport failed; request result may be unknown; mutations are never replayed") from None
+                        raise ApiError("HTTP transport failed; request result may be unknown; mutations are never replayed",
+                                       operation=path, method=method) from None
+            except ApiError as error:
+                # Helpers such as bounded body reads also keep request context,
+                # without retaining query strings, request payloads or headers.
+                if error.operation is None:
+                    error.operation = _operation_path(path)
+                    error.method = method
+                raise
             finally:
                 self.timings.append({"method": method, "path": path, "attempts": attempt,
                                      "seconds": round(time.monotonic() - started, 3)})

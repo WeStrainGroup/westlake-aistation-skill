@@ -188,5 +188,11 @@ def profile_identity(profile):
 
 
 def state_directory(profile):
+    explicit = os.environ.get('WLAI_STATE_ROOT')
+    if explicit:
+        root = Path(explicit).expanduser()
+        if not root.is_absolute() or root == Path('/') or any(ord(char) < 32 for char in explicit):
+            raise ConfigurationError('WLAI_STATE_ROOT must name a non-root absolute local directory')
+        return root / profile_identity(profile)
     root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))).expanduser()
     return root / "westlake-aistation" / profile_identity(profile)
