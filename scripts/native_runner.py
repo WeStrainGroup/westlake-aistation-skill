@@ -7,6 +7,7 @@ client package, credentials or a machine-learning framework.
 """
 import base64
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -245,5 +246,30 @@ def main(payload):
     return run(spec)
 
 
+def main_args(arguments):
+    """Accept the original inline manifest or an explicitly hashed file."""
+    if len(arguments) == 1:
+        return main(arguments[0])
+    if (len(arguments) == 4 and arguments[0] == '--manifest-file'
+            and arguments[2] == '--manifest-sha256'):
+        try:
+            path, expected = arguments[1], arguments[3]
+            if not os.path.isabs(path) or not re.fullmatch(r'[0-9a-f]{64}', expected):
+                raise ValueError('Invalid manifest file arguments')
+            with open(path, 'rb') as source:
+                data = source.read()
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise ValueError('Manifest checksum mismatch')
+            # main() decodes exactly the bytes checked above, without reopening.
+            return main(base64.urlsafe_b64encode(data).decode('ascii'))
+        except (OSError, ValueError, UnicodeError, TypeError):
+            print(RECEIPT_PREFIX + json.dumps({'schema': 1, 'state': 'GUARD_FAILED',
+                  'error_code': 'INVALID_MANIFEST_FILE'}), flush=True)
+            return 125
+    print(RECEIPT_PREFIX + json.dumps({'schema': 1, 'state': 'GUARD_FAILED',
+          'error_code': 'INVALID_MANIFEST_ARGUMENTS'}), flush=True)
+    return 125
+
+
 if __name__ == '__main__':
-    raise SystemExit(main(sys.argv[1]))
+    raise SystemExit(main_args(sys.argv[1:]))

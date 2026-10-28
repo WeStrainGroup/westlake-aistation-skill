@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from config import ConfigurationError, default_profile_path, execution_requirements, load_profile, state_directory, validate_profile, write_profile
-from credentials import CredentialError, _service, _system_keyring, get_password, password_available, store_password
+from credentials import CredentialError, _service, _system_keyring, clear_session_passwords, get_password, password_available, store_password
 
 
 class ProfileTests(unittest.TestCase):
@@ -31,6 +31,13 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(profile["ssh_host"], "cluster.example.org")
         self.assertEqual(profile["max_environment_seconds"], 14400)
         self.assertNotIn("password", profile)
+        self.assertEqual(profile['credential_mode'], 'prompt')
+    def test_system_store_requires_explicit_profile_choice(self):
+        profile = validate_profile(dict(self.source, credential_mode='system-store'), self.root)
+        self.assertEqual(profile['credential_mode'], 'system-store')
+        for value in ('keychain', 'file', '', None):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                validate_profile(dict(self.source, credential_mode=value), self.root)
     def test_load_explicit_profile_and_env_override(self):
         target = self.root / "profile.json"
         target.write_text(json.dumps(self.source))
@@ -105,15 +112,38 @@ class ProfileTests(unittest.TestCase):
 class CredentialTests(unittest.TestCase):
     def setUp(self):
         self.profile = {"portal": "https://cluster.example.org", "account": "example-user"}
+        clear_session_passwords()
+        self.addCleanup(clear_session_passwords)
     def test_saved_password_used_without_prompt(self):
+        self.profile['credential_mode'] = 'system-store'
         with patch("credentials._read_stored", return_value="synthetic-hidden-value"), patch("credentials.getpass.getpass") as prompt:
             self.assertEqual(get_password(self.profile, interactive=False), "synthetic-hidden-value")
             prompt.assert_not_called()
     def test_background_missing_credential_fails_without_prompt(self):
-        with patch("credentials._read_stored", return_value=None), patch("credentials.getpass.getpass") as prompt:
+        with patch("credentials._read_stored", side_effect=AssertionError('Default input opened OS store')) as store, patch("credentials.getpass.getpass") as prompt:
             with self.assertRaises(CredentialError):
                 get_password(self.profile, interactive=False)
             prompt.assert_not_called()
+            store.assert_not_called()
+    def test_default_prompt_never_consults_existing_system_credentials(self):
+        with patch('credentials._read_stored', side_effect=AssertionError('OS store consulted')) as store, \
+             patch('credentials.sys.stdin.isatty', return_value=True), \
+             patch('credentials.getpass.getpass', return_value='synthetic-direct-value') as prompt:
+            self.assertEqual(get_password(self.profile), 'synthetic-direct-value')
+            self.assertEqual(get_password(self.profile), 'synthetic-direct-value')
+            prompt.assert_called_once()
+            store.assert_not_called()
+        self.assertNotIn('synthetic-direct-value', json.dumps(self.profile))
+    def test_memory_cache_is_isolated_by_account_and_portal_and_not_detached_availability(self):
+        with patch('credentials.sys.stdin.isatty', return_value=True), \
+             patch('credentials.getpass.getpass', side_effect=['first', 'second', 'third']) as prompt, \
+             patch('credentials._read_stored', side_effect=AssertionError('OS store consulted')):
+            self.assertEqual(get_password(self.profile), 'first')
+            self.assertEqual(get_password(dict(self.profile, account='other')), 'second')
+            self.assertEqual(get_password(dict(self.profile, portal='https://other.example.org')), 'third')
+            self.assertEqual(get_password(self.profile, interactive=False), 'first')
+            self.assertFalse(password_available(self.profile))
+            self.assertEqual(prompt.call_count, 3)
     def test_password_is_hidden_and_never_read_from_environment(self):
         with patch("credentials._read_stored", return_value=None), patch("credentials.sys.stdin.isatty", return_value=True), \
                 patch("credentials.getpass.getpass", return_value="synthetic-interactive-value") as prompt, \

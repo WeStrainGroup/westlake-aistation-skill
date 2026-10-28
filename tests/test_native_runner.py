@@ -1,6 +1,7 @@
 """Offline startup guard, persistent receipts and process cleanup checks."""
 import contextlib
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -55,6 +56,28 @@ class NativeRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(runner.GuardError, 'STORAGE_MOUNT_UNVERIFIED'):
                 runner.verify_storage(self.spec)
         self.assertFalse(self.run_dir.exists())
+
+    def test_manifest_file_entrypoint_checks_exact_bytes_before_running(self):
+        path = self.personal / 'manifest.json'
+        content = json.dumps(self.spec, sort_keys=True, separators=(',', ':')).encode()
+        path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        with patch.object(runner, 'run', return_value=17) as run:
+            self.assertEqual(runner.main_args(['--manifest-file', str(path), '--manifest-sha256', digest]), 17)
+        run.assert_called_once_with(self.spec)
+
+    def test_manifest_file_mismatch_or_missing_never_runs_program(self):
+        path = self.personal / 'manifest.json'
+        path.write_bytes(b'{}')
+        for arguments in (['--manifest-file', str(path), '--manifest-sha256', '0' * 64],
+                          ['--manifest-file', str(path.with_name('missing.json')), '--manifest-sha256', '0' * 64],
+                          ['--manifest-file', 'relative.json', '--manifest-sha256', '0' * 64],
+                          ['--manifest-file', str(path), '--manifest-sha256', 'invalid'], []):
+            with self.subTest(arguments=arguments), patch.object(runner, 'run') as run, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(runner.main_args(arguments), 125)
+                run.assert_not_called()
+                self.assertNotIn(str(path), output.getvalue())
 
     def test_storage_rejects_nested_shadow_and_stacked_mounts(self):
         for extra, reason in [(f'3 2 0:3 / {self.run_dir} rw - tmpfs tmpfs rw\n', 'STORAGE_SHADOWED_OR_EPHEMERAL'),

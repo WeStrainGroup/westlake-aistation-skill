@@ -15,15 +15,24 @@ import tempfile
 import time
 import zlib
 
-from api import AIStation, rows
+from api import AIStation, ApiError, rows
 from config import load_profile, state_directory
 from credentials import get_password
 from registry import Registry, profile_identity, utcnow, validate_run_id
 
 
-TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELLED', 'DELETED', 'RESOURCE_MISMATCH', 'COMPLETED_UNVERIFIED'}
+TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELLED', 'DELETED', 'REJECTED', 'RESOURCE_MISMATCH', 'COMMAND_MISMATCH', 'COMPLETED_UNVERIFIED'}
 RECEIPT_PREFIX = 'WLAI_NATIVE_RECEIPT '
 PLATFORM_TERMINAL = {'Succeeded', 'Failed', 'Stopped', 'Deleted'}
+_VALIDATION_REJECTIONS = {
+    'IRESOURCE_STRING_LENGTH_ILLEGAL', 'COMMON_PARAMETER_NOT_MATCH',
+    'IRESOURCE_INPUT_GPU_MORE_THAN_WORK_PLATFORM_CONFIG_LIMIT',
+    'IRESOURCE_CREATE_WORK_PLATFORM_RES_GROUP_NOT_MATCH_LABEL',
+    'IRESOURCE_COMMON_RES_GROUP_CAN_NOT_BE_USED',
+    'IRESOURCE_DUPLICATED_ACCOUNT_MOUNT_PATH',
+    'IRESOURCE_MAX_WOKR_PLATFORM_COUNT_EXCEED',
+    'IRESOURCE_MAX_WORK_PLATFORM_COUNT_EXCEED',
+}
 _STATES = {'Pending': 'QUEUED', 'Queuing': 'QUEUED', 'ImagePulling': 'STARTING',
            'DatasetPulling': 'STARTING', 'Running': 'RUNNING', 'Terminating': 'STOP_REQUESTED',
            'Succeeded': 'SUCCEEDED', 'Failed': 'FAILED', 'Stopped': 'CANCELLED', 'Deleted': 'DELETED'}
@@ -135,6 +144,9 @@ def prepare_task_spec(source, profile):
     spec['task_name'] = _text(spec['task_name'], 'task_name')
     if len(spec['task_name']) > 63 or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', spec['task_name']):
         raise ValueError('task_name must use at most 63 letters, numbers, underscores, dots or hyphens')
+    # Conservative client budget, not a promise about every server deployment.
+    # Large launchers/argument lists should be staged as verified files.
+    spec.setdefault('command_max_bytes', 1000)
     command_maximum = spec.get('command_max_bytes')
     if command_maximum is not None:
         if type(command_maximum) is not int or command_maximum < 1:
@@ -184,25 +196,36 @@ def build_task_payload(spec, project_id=None):
         loader = ("import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("
                   + repr(compressed) + ")), '<wlai-native-runner>', 'exec'))")
     outer_seconds = spec['max_seconds'] + spec['guard_seconds'] + spec['receipt_seconds']
+    # This deployment rewrites double quotes to single quotes and literal
+    # newlines to spaces before storing commands. Shell quote splicing is not
+    # stable across that boundary. Keep all loader text in a base64 argument;
+    # the outer Python expression has no embedded string literals or newlines.
+    envelope = 'import base64,sys;exec(base64.b64decode(sys.argv.pop(1)))'
     command_argv = ['timeout', '--signal=TERM', '--kill-after=30', str(outer_seconds),
-                    spec['guard_python'], '-u', '-c', loader]
+                    spec['guard_python'], '-u', '-c', envelope,
+                    base64.b64encode(loader.encode('utf-8')).decode('ascii')]
     if not spec.get('guard_manifest'):
         command_argv.append(base64.urlsafe_b64encode(manifest_bytes).decode('ascii'))
     command = shlex.join(command_argv)
+    if any(character in command for character in ('"', '\r', '\n')):
+        raise ValueError('The native launcher executable path requires unsupported platform quoting; use an equivalent path without quotes or control characters')
     command_bytes = len(command.encode('utf-8'))
     maximum = spec.get('command_max_bytes')
     if maximum is not None and command_bytes > maximum:
-        raise ValueError(f'Native command uses {command_bytes} bytes, exceeding configured command_max_bytes={maximum}; no task request was sent')
+        raise ValueError(f'Native command uses {command_bytes} bytes, exceeding configured command_max_bytes={maximum}; stage guard_script and guard_manifest on persistent storage, then plan again; no task request was sent')
     worker = {'nodeNum': 1, 'cpuNum': spec['cpus'], 'acceleratorCardNum': spec['gpus'],
               'memory': spec['memory_gb'], 'minNodeNum': -1}
     fingerprint = spec_fingerprint(spec)
+    # Do not copy the frontend route's taskType into this creation body. On
+    # the validated deployment its presence selected data processing and
+    # discarded GPU resources; omission created the intended training task.
     result = {'name': spec['task_name'], 'description': 'wlai:' + fingerprint, 'imageType': spec['framework'],
               'resGroupId': spec['resource_group_id'], 'acceleratorCardType': spec['card_type'],
               'image': spec['image'], 'mountDir': '', 'startScript': '', 'logOut': '',
               'distFlag': False, 'enUpdateDataSet': 0, 'ports': '', 'param': None,
               'execDir': '', 'nodeName': '', 'mpiFlag': False, 'type': spec['framework'],
               'shmSize': 4, 'datasetId': None, 'emergencyFlag': False, 'imageFlag': 0,
-              'switchType': 'ib', 'taskType': '1',
+              'switchType': 'ib',
               'acceleratorCardKind': 'GPU' if spec['gpus'] else 'CPU', 'models': [],
               'config': json.dumps({'worker': worker}, separators=(',', ':')),
               'command': command, 'commandScriptList': [], 'jobVolume': spec['volumes'],
@@ -377,7 +400,9 @@ class NativeTasks:
                     'Node availability does not prove account quota or storage quota approval.',
                     'Platform task execution continues independently of this client; watch is only an observer.',
                     'Native outputs remain in persistent storage; this command does not copy result files through container SSH.',
-                    'Program exit and platform success do not validate scientific outputs.']
+                    'Program exit and platform success do not validate scientific outputs.',
+                    'Compatibility evidence is deployment-specific; verify returned command/resources, actual hardware and a persisted receipt for every run.',
+                    'The default 1000-byte command budget is a client safeguard, not an official universal platform limit.']
         if spec.get('group_max_seconds') is None:
             warnings.append('Training-group lifetime is not verified; confirm the selected group policy instead of assuming five days.')
         if spec.get('command_max_bytes') is None:
@@ -396,7 +421,7 @@ class NativeTasks:
                 'configured_command_max_bytes': spec.get('command_max_bytes'),
                 'project_id_resolved': bool(self._user and self._user.get('groupId')),
                 'group_label_verified': bool(group), 'warnings': warnings,
-                'native_compatibility': 'unverified', 'experimental_required': True,
+                'native_compatibility': 'validated_single_node', 'experimental_required': False,
                 'submitted': bool(record.get('task_id'))}
 
     def _record(self, run_id):
@@ -461,10 +486,13 @@ class NativeTasks:
             record = self._record(run_id)
             if record.get('task_id'):
                 return self.status(run_id)
+            if record['state'] == 'REJECTED':
+                # A known validation rejection is final for this immutable ID.
+                return record
             if record['state'] != 'PLANNED':
                 raise RuntimeError('Creation outcome requires task-reconcile; no task creation was repeated')
-            if not experimental:
-                raise RuntimeError('Native task creation is unverified on this deployment; explicit experimental=True is required and is not production validation')
+            # experimental remains an accepted compatibility argument. Native
+            # submission is now the normal single-node task-management path.
             # Validate an explicit command budget before authentication or live
             # resource discovery. Existing tasks keep their frozen old request.
             build_task_payload(spec)
@@ -501,6 +529,11 @@ class NativeTasks:
             try:
                 created = self.client.call('POST', '/api/iresource/v1/train', body=payload)
             except BaseException as error:
+                if (isinstance(error, ApiError) and error.status is None
+                        and error.code in _VALIDATION_REJECTIONS):
+                    return self.registry.update(run_id, state='REJECTED', uncertain_action=None,
+                        creation_error=_safe_error(error), resource_released=True, requires_reconcile=False,
+                        release_basis='platform_rejected_no_task_created')
                 unknown = self.registry.update(run_id, state='UNKNOWN', uncertain_action='task-creation',
                                                creation_error=_safe_error(error), resource_released=False)
                 if not isinstance(error, Exception):
@@ -556,6 +589,11 @@ class NativeTasks:
         self._owned(row, record, record.get('task_id'))
         platform = row.get('status')
         terminal = platform in PLATFORM_TERMINAL
+        expected_command = (record.get('submitted_request') or {}).get('command')
+        returned_command = row.get('command')
+        command_mismatch = bool(record.get('command_mismatch') or
+            isinstance(expected_command, str) and isinstance(returned_command, str)
+            and returned_command != expected_command)
         verified, mismatch = self._resource_check(row, record['spec'])
         state = _STATES.get(platform, 'UNRECOGNIZED_PLATFORM_STATE')
         if record.get('resource_mismatch') or verified is False:
@@ -564,10 +602,16 @@ class NativeTasks:
             state, verified, mismatch = 'RESOURCE_MISMATCH', False, 'Running task resources are unverified'
         elif (record.get('stop_requested') or record.get('cancel_requested')) and not terminal:
             state = 'STOP_REQUESTED'
+        if command_mismatch:
+            state = 'COMMAND_MISMATCH'
         values = {'state': state, 'platform_state': platform, 'resource_released': terminal,
                   'gpu_config_verified': verified is True, 'scientific_outputs_verified': False,
                   'release_basis': 'platform_terminal' if terminal else None,
                   'last_observed_at': utcnow()}
+        if command_mismatch:
+            values.update(command_mismatch=True, command_validation_message='The platform changed the immutable submitted command; execution is not verified',
+                          returned_command_sha256=hashlib.sha256(returned_command.encode()).hexdigest()
+                          if isinstance(returned_command, str) else None)
         if mismatch:
             values['resource_validation_message'] = mismatch
         if verified is False:
@@ -575,7 +619,7 @@ class NativeTasks:
         if terminal and verified is None:
             values.update(state='RESOURCE_MISMATCH', resource_mismatch=True)
         values['requires_stop'] = bool((record.get('cancel_requested') or verified is False
-                                       or record.get('resource_mismatch')) and not terminal)
+                                       or record.get('resource_mismatch') or command_mismatch) and not terminal)
         if terminal:
             try:
                 receipt = self._fetch_logs(run_id, row).get('native_receipt')
@@ -586,7 +630,7 @@ class NativeTasks:
                 receipt = None
                 values['native_receipt'] = None
             values['hardware_verified'] = _hardware_receipt_valid(receipt, record['spec'])
-            if platform == 'Succeeded' and state != 'RESOURCE_MISMATCH':
+            if platform == 'Succeeded' and state not in ('RESOURCE_MISMATCH', 'COMMAND_MISMATCH'):
                 values['state'] = 'SUCCEEDED' if _successful_receipt(receipt, record['spec']) else 'COMPLETED_UNVERIFIED'
         updated = self.registry.update(run_id, **values)
         if enforce_resources and updated.get('requires_stop') and not terminal and not updated.get('stop_requested'):
@@ -596,6 +640,8 @@ class NativeTasks:
     def status(self, run_id, refresh=True, enforce_resources=False):
         record = self._record(run_id)
         if not refresh:
+            return record
+        if record['state'] == 'REJECTED' and not record.get('task_id'):
             return record
         if not record.get('task_id'):
             raise RuntimeError('Task ID is unknown; use task-reconcile before further action')
@@ -631,6 +677,8 @@ class NativeTasks:
 
     def logs(self, run_id, refresh=True):
         record = self._record(run_id)
+        if record['state'] == 'REJECTED' and not record.get('task_id'):
+            return record
         if not refresh and record.get('logs_cache'):
             return json.loads(Path(record['logs_cache']).read_text())
         if not record.get('task_id'):
@@ -664,7 +712,8 @@ class NativeTasks:
                 return current
             if not current.get('stop_requested'):
                 self.registry.update(run_id, stop_requested=True,
-                                     state='RESOURCE_MISMATCH' if current.get('resource_mismatch') else 'STOP_REQUESTED')
+                                     state='COMMAND_MISMATCH' if current.get('command_mismatch') else
+                                     'RESOURCE_MISMATCH' if current.get('resource_mismatch') else 'STOP_REQUESTED')
                 try:
                     self.client.call('POST', '/api/iresource/v1/train/' + str(record['task_id']) + '/stop')
                 except Exception as error:
@@ -695,6 +744,8 @@ class NativeTasks:
 
     def reconcile(self, run_id, enforce_resources=False):
         record = self._record(run_id)
+        if record['state'] == 'REJECTED' and not record.get('task_id'):
+            return record
         if record.get('task_id'):
             return self.status(run_id)
         found = self._by_name(record)

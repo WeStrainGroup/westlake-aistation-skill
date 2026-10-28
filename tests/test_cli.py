@@ -43,7 +43,7 @@ class CLITests(unittest.TestCase):
             self.assertEqual(target.read_text(), '{}')
 
     def test_login_hidden_input_does_not_save_password_without_opt_in(self):
-        fake = {'account': 'sample_user'}
+        fake = {'account': 'sample_user', 'portal': 'https://aistation.example.edu'}
         events = []
         class FakeClient:
             def __init__(self, *args, **kwargs): pass
@@ -51,7 +51,9 @@ class CLITests(unittest.TestCase):
             def close(self): events.append(('close',))
         secret = 'test-only-input-that-must-not-be-printed'
         with patch('config.load_profile', return_value=fake), patch('api.AIStation', FakeClient), \
-             patch('credentials.store_password') as store, patch('cli.sys.stdin.isatty', return_value=True), \
+             patch('credentials.store_password') as store, \
+             patch('credentials._read_stored', side_effect=AssertionError('Default login opened OS store')), \
+             patch('cli.sys.stdin.isatty', return_value=True), \
              patch('cli.getpass.getpass', return_value=secret), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(cli.main(['login']), 0)
             store.assert_not_called()
@@ -69,6 +71,21 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(cli.main(['--state-dir', directory, 'runs']), 0)
                 cluster.assert_not_called()
                 self.assertEqual(json.loads(output.getvalue())[0]['run_id'], 'local_run')
+
+    def test_system_store_read_requires_explicit_global_choice(self):
+        fake = {'account': 'sample_user', 'portal': 'https://aistation.example.edu'}
+        class FakeClient:
+            def __init__(self, profile): self.profile = profile
+            def login(self, account, password):
+                self.profile['authenticated_using_store'] = password == 'synthetic-store-value'
+            def close(self): pass
+        with patch('config.load_profile', return_value=fake), patch('api.AIStation', FakeClient), \
+             patch('credentials._read_stored', return_value='synthetic-store-value') as store, \
+             patch('credentials.getpass.getpass') as prompt, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['--use-keychain', '--non-interactive', 'login']), 0)
+            store.assert_called_once()
+            prompt.assert_not_called()
+        self.assertTrue(fake['authenticated_using_store'])
 
     def test_connection_setup_and_discovery_do_not_require_compute_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -154,7 +171,7 @@ class CLITests(unittest.TestCase):
             source['training_group_id'] = 'example-training'
             profile.write_text(json.dumps(source))
             spec = root / 'native.json'
-            spec.write_text(json.dumps({'run_id': 'native_offline', 'max_seconds': 86400,
+            spec.write_text(json.dumps({'run_id': 'native_offline', 'max_seconds': 86400, 'command_max_bytes': 20000,
                                         'argv': ['/opt/conda/bin/python', '/example-user/train.py']}))
             with contextlib.redirect_stdout(io.StringIO()) as output, \
                  patch('native.get_password', side_effect=AssertionError('offline authentication')):

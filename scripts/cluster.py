@@ -946,6 +946,8 @@ class Cluster:
             profile_path = self.profile.get('_path')
             if not profile_path:
                 raise ValueError('Background submission requires a saved profile path')
+            if self.profile.get('credential_mode', 'prompt') != 'system-store':
+                raise RuntimeError('Detached development controllers require explicit system-store opt-in; use foreground run for direct password input')
             # Check before spawning so a detached process cannot wait for hidden stdin.
             get_password(self.profile, interactive=False)
             self.plan(spec)
@@ -955,10 +957,14 @@ class Cluster:
                 with request.open('x') as output:
                     os.chmod(request,0o600); json.dump(spec,output,ensure_ascii=False,indent=2)
             logfile = self.registry.root / (run_id + '.controller.log')
+            command = [sys.executable, str(ROOT/'cli.py'), '--profile', str(profile_path),
+                       '--state-dir', str(self.registry.root), '--non-interactive']
+            if self.profile.get('credential_mode') == 'system-store':
+                command.append('--use-keychain')
+            command += ['run', '--spec', str(request), '--execute']
             with logfile.open('ab') as output:
                 os.chmod(logfile,0o600)
-                process = subprocess.Popen([sys.executable,str(ROOT/'cli.py'),'--profile',str(profile_path),
-                    '--state-dir',str(self.registry.root),'--non-interactive','run','--spec',str(request),'--execute'],
+                process = subprocess.Popen(command,
                     stdin=subprocess.DEVNULL,stdout=output,stderr=output,start_new_session=True)
             self.registry.update(run_id,supervisor_pid=process.pid,supervisor_log=str(logfile))
             # A flock, not kill(pid,0), proves ownership. PID reuse is never accepted as controller identity.

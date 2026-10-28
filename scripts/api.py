@@ -180,6 +180,10 @@ class AIStation:
         attempt = 0
         # Single reusable connection; serialize callers to preserve HTTP framing.
         with self._lock:
+            if method != 'GET':
+                # Never send a one-shot mutation over a possibly idle-closed
+                # keepalive socket. This is a fresh connection, not a replay.
+                self.close()
             try:
                 while True:
                     attempt += 1

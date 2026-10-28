@@ -80,6 +80,31 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(factory.call_count, 1)
         api.close()
         self.assertIsNone(api.connection)
+    def test_mutation_discards_stale_read_connection_before_sending_once(self):
+        old = Connection([Response('read')])
+        fresh = Connection([Response('created')])
+        with patch('api.http.client.HTTPSConnection', side_effect=[old, fresh]) as factory:
+            api = AIStation(PROFILE)
+            self.assertEqual(api.call('GET', '/api/read'), 'read')
+            self.assertEqual(api.call('POST', '/api/create', body={'value': 1}), 'created')
+        self.assertIsNone(old.sock)
+        self.assertEqual([request[0] for request in old.requests], ['GET'])
+        self.assertEqual([request[0] for request in fresh.requests], ['POST'])
+        self.assertEqual(fresh.connects, 1)
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(api.timings[-1]['attempts'], 1)
+    def test_each_mutation_uses_fresh_connection_but_following_reads_reuse_it(self):
+        first = Connection([Response('first')])
+        second = Connection([Response('second'), Response('read')])
+        with patch('api.http.client.HTTPSConnection', side_effect=[first, second]) as factory:
+            api = AIStation(PROFILE)
+            self.assertEqual(api.call('POST', '/api/first'), 'first')
+            self.assertEqual(api.call('PUT', '/api/second'), 'second')
+            self.assertEqual(api.call('GET', '/api/read'), 'read')
+        self.assertIsNone(first.sock)
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual([request[0] for request in second.requests], ['PUT', 'GET'])
+        self.assertEqual(second.connects, 1)
     def test_connect_and_request_do_not_restart_outer_deadline_for_headers(self):
         now = [0.0]
         api, connection, _ = self.make([Response('ok')], deadline_provider=lambda: 6.0)

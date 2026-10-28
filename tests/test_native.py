@@ -14,6 +14,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 from native import (NativeTasks, build_task_payload, prepare_task_spec, parse_native_receipt,
                     spec_fingerprint, _successful_receipt, RECEIPT_PREFIX)
+from api import ApiError
 
 
 PROFILE = {'portal': 'https://cluster.example.edu', 'account': 'sample-user',
@@ -96,7 +97,7 @@ class NativeTests(unittest.TestCase):
         self.api = FakeAPI()
         self.client = NativeTasks(PROFILE, state_dir=self.directory.name, client=self.api, user=USER)
         self.spec = prepare_task_spec({'run_id': 'example', 'argv': ['/opt/conda/bin/python', '-u', '/sample-user/train.py'],
-                                       'max_seconds': 86400}, PROFILE)
+                                       'max_seconds': 86400, 'command_max_bytes': 20000}, PROFILE)
 
     def test_offline_plan_never_authenticates_or_accesses_network(self):
         client = NativeTasks(PROFILE, state_dir=self.directory.name)
@@ -107,14 +108,21 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn('projectId', result['request'])
         self.assertFalse(result['project_id_resolved'])
         self.assertIn('tasks', str(client.registry.root))
-        self.assertEqual(result['native_compatibility'], 'unverified')
-        self.assertTrue(result['experimental_required'])
+        self.assertEqual(result['native_compatibility'], 'validated_single_node')
+        self.assertFalse(result['experimental_required'])
 
-    def test_new_creations_require_experimental_flag_including_cpu(self):
-        for gpus in (0, 1):
-            with self.subTest(gpus=gpus), self.assertRaisesRegex(RuntimeError, 'experimental=True'):
-                self.client.submit(prepare_task_spec(dict(self.spec, run_id='gate' + str(gpus), gpus=gpus), PROFILE),
-                                   execute=True)
+    def test_normal_native_submission_does_not_require_experimental_flag(self):
+        result = self.client.submit(self.spec, execute=True)
+        self.assertEqual(result['state'], 'QUEUED')
+        self.assertEqual(self.api.count_creates(), 1)
+
+    def test_default_command_budget_rejects_long_embedded_command_before_network(self):
+        source = dict(self.spec)
+        source.pop('command_max_bytes')
+        prepared = prepare_task_spec(source, PROFILE)
+        self.assertEqual(prepared['command_max_bytes'], 1000)
+        with self.assertRaisesRegex(ValueError, 'stage guard_script and guard_manifest'):
+            self.client.plan(prepared, online=True)
         self.assertEqual(self.api.calls, [])
 
     def test_native_duration_does_not_use_development_limit(self):
@@ -135,15 +143,16 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(worker['nodeNum'], 1)
         self.assertEqual(worker['acceleratorCardNum'], 1)
         self.assertEqual(payload['jobVolume'], [])
-        self.assertEqual(payload['taskType'], '1')
+        self.assertNotIn('taskType', payload)
         self.assertEqual(payload['projectId'], USER['groupId'])
         self.assertIn('--kill-after=30', payload['command'])
         self.assertTrue(payload['description'].startswith('wlai:'))
 
     def test_compressed_loader_restores_exact_runner_source_and_keeps_manifest_separate(self):
         command = shlex.split(build_task_payload(self.spec)['command'])
-        self.assertEqual(command[-3], '-c')
-        loader, manifest = command[-2:]
+        code_index = command.index('-c')
+        loader = base64.b64decode(command[code_index + 2]).decode('utf-8')
+        manifest = command[-1]
         captured = []
         def capture_compile(source, filename, mode):
             captured.append((source, filename, mode))
@@ -179,6 +188,8 @@ class NativeTests(unittest.TestCase):
                 command = build_task_payload(prepare_task_spec(source, PROFILE))['command']
                 self.assertNotIn('\n', command)
                 self.assertNotIn('\r', command)
+                self.assertNotIn(chr(34), command)
+                self.assertEqual(command.replace(chr(34), chr(39)).replace('\n', ' '), command)
 
     def local_staged_guard(self):
         root = Path(self.directory.name)
@@ -188,7 +199,7 @@ class NativeTests(unittest.TestCase):
         spec = prepare_task_spec(dict(self.spec, run_id='local_staged', storage_mount=str(root),
                                       guard_script=str(script)), profile)
         command = shlex.split(build_task_payload(spec)['command'])
-        return spec, script, command[-2], command[-1]
+        return spec, script, base64.b64decode(command[command.index('-c') + 2]).decode('utf-8'), command[-1]
 
     def test_staged_loader_executes_verified_complete_source_with_separate_manifest(self):
         spec, script, loader, manifest = self.local_staged_guard()
@@ -254,8 +265,7 @@ class NativeTests(unittest.TestCase):
         manifest.write_bytes(json.dumps(plan['guard_manifest_content'], sort_keys=True,
                                         separators=(',', ':')).encode('utf-8'))
         command = shlex.split(plan['request']['command'])
-        self.assertEqual(command[-2], '-c')
-        return spec, script, manifest, command[-1], plan
+        return spec, script, manifest, base64.b64decode(command[command.index('-c') + 2]).decode('utf-8'), plan
 
     def test_staged_files_loader_verifies_both_complete_buffers_before_execution(self):
         spec, script, manifest, loader, plan = self.local_staged_files()
@@ -277,6 +287,47 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(expected_manifest).hexdigest(), plan['guard_manifest_sha256'])
         self.assertEqual(plan['guard_manifest_content']['spec_sha256'], spec_fingerprint(spec))
         self.assertNotIn('guard_manifest_sha256', spec)
+
+    def test_wire_envelope_survives_observed_platform_quote_and_newline_rewrite(self):
+        spec, script, manifest, loader, plan = self.local_staged_files()
+        command = plan['request']['command']
+        rewritten = command.replace(chr(34), chr(39)).replace('\n', ' ')
+        self.assertEqual(rewritten, command)
+        words = shlex.split(rewritten)
+        offset = words.index('-c')
+        captured = []
+        def capture_compile(source, filename, mode):
+            captured.append(source)
+            return compile(source, filename, mode)
+        namespace = {'__name__': 'guard_wire_test', 'compile': capture_compile}
+        with patch.object(sys, 'argv', ['-c', *words[offset + 2:]]):
+            exec(words[offset + 1], namespace)
+            self.assertEqual(json.loads(base64.urlsafe_b64decode(sys.argv[1])), plan['guard_manifest_content'])
+        self.assertEqual(captured, [SCRIPTS.joinpath('native_runner.py').read_bytes()])
+        self.assertTrue(callable(namespace['run']))
+
+    def test_new_submission_stops_if_platform_changes_command(self):
+        original = self.api.call
+        def changed(method, path, params=None, body=None):
+            result = original(method, path, params, body)
+            if method == 'POST' and path.endswith('/train'):
+                self.api.tasks[result['id']]['command'] += ' ; true'
+            return result
+        self.api.call = changed
+        result = self.client.submit(self.spec, execute=True, experimental=True)
+        self.assertEqual(result['state'], 'COMMAND_MISMATCH')
+        self.assertTrue(result['command_mismatch'])
+        self.assertTrue(result['resource_released'])
+        self.assertEqual(self.api.count_creates(), 1)
+        self.assertEqual(self.api.count_stops(), 1)
+
+    def test_observer_reports_changed_command_without_mutating_platform(self):
+        result = self.client.submit(self.spec, execute=True, experimental=True)
+        self.api.tasks[result['task_id']]['command'] += ' ; true'
+        updated = self.client.status(self.spec['run_id'])
+        self.assertEqual(updated['state'], 'COMMAND_MISMATCH')
+        self.assertTrue(updated['requires_stop'])
+        self.assertEqual(self.api.count_stops(), 0)
 
     def test_staged_files_checksum_mismatch_in_either_file_never_compiles(self):
         for changed in ('guard', 'manifest', 'both'):
@@ -323,7 +374,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(plan['guard_script_sha256'], self.spec['guard_script_sha256'])
         self.assertIsNone(plan['guard_manifest_content'])
         self.assertIsNone(plan['guard_manifest_sha256'])
-        self.assertIsNone(plan['configured_command_max_bytes'])
+        self.assertEqual(plan['configured_command_max_bytes'], 20000)
         limited = prepare_task_spec(dict(self.spec, run_id='limited', command_max_bytes=20000), PROFILE)
         self.assertEqual(self.client.plan(limited)['configured_command_max_bytes'], 20000)
 
@@ -462,6 +513,72 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(result['state'], 'UNKNOWN')
         self.assertEqual(result['creation_error']['platform_code'], Rejected.code)
         self.assertNotIn('synthetic-hidden-credential-material', json.dumps(result))
+
+    def test_known_flag_false_rejection_is_not_an_unknown_or_failed_gpu_run(self):
+        original = self.api.call
+        attempts = []
+        def rejected(method, path, params=None, body=None):
+            if method == 'POST' and path.endswith('/train'):
+                attempts.append(body)
+                raise ApiError('response suppressed', code='IRESOURCE_STRING_LENGTH_ILLEGAL',
+                               operation=path, method=method)
+            return original(method, path, params, body)
+        self.api.call = rejected
+        result = self.client.submit(self.spec, execute=True, experimental=True)
+        self.assertEqual(result['state'], 'REJECTED')
+        self.assertIsNone(result['uncertain_action'])
+        self.assertTrue(result['resource_released'])
+        self.assertFalse(result['requires_reconcile'])
+        self.assertEqual(result['release_basis'], 'platform_rejected_no_task_created')
+        self.assertEqual(result['creation_error']['platform_code'], 'IRESOURCE_STRING_LENGTH_ILLEGAL')
+        self.assertNotIn('task_id', result)
+        self.assertEqual(self.client.submit(self.spec, execute=True, experimental=True), result)
+        self.assertEqual(len(attempts), 1)
+
+    def test_rejected_task_operations_use_local_evidence_without_network_or_unknown(self):
+        self.client.plan(self.spec)
+        rejected = self.client.registry.update('example', state='REJECTED', resource_released=True,
+            uncertain_action=None, requires_reconcile=False,
+            release_basis='platform_rejected_no_task_created',
+            creation_error={'type': 'ApiError', 'platform_code': 'COMMON_PARAMETER_NOT_MATCH'})
+        self.api.call = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('Rejected run used network'))
+        for operation in (self.client.status, self.client.logs, self.client.stop, self.client.reconcile,
+                          lambda run_id: self.client.watch(run_id, interval=0.01, timeout=0.01)):
+            with self.subTest(operation=operation):
+                self.assertEqual(operation('example'), rejected)
+
+    def test_http_500_and_transport_timeout_stay_unknown_even_with_validation_like_code(self):
+        for index, error in enumerate((ApiError('http failure', status=500, code='COMMON_PARAMETER_NOT_MATCH'),
+                                       TimeoutError('synthetic-hidden-transport-detail'))):
+            with self.subTest(error=type(error).__name__):
+                original = FakeAPI().call
+                def ambiguous(method, path, params=None, body=None):
+                    if method == 'POST' and path.endswith('/train'):
+                        raise error
+                    return original(method, path, params, body)
+                self.api.call = ambiguous
+                spec = prepare_task_spec(dict(self.spec, run_id='ambiguous_' + str(index)), PROFILE)
+                result = self.client.submit(spec, execute=True, experimental=True)
+                self.assertEqual(result['state'], 'UNKNOWN')
+                self.assertFalse(result['resource_released'])
+                self.assertEqual(result['uncertain_action'], 'task-creation')
+
+    def test_only_known_api_validation_codes_can_claim_no_task_was_created(self):
+        codes = ('COMMON_PARAMETER_NOT_MATCH', 'IRESOURCE_INPUT_GPU_MORE_THAN_WORK_PLATFORM_CONFIG_LIMIT',
+                 'IRESOURCE_CREATE_WORK_PLATFORM_RES_GROUP_NOT_MATCH_LABEL', 'IRESOURCE_UNCLASSIFIED_FAILURE')
+        for index, code in enumerate(codes):
+            with self.subTest(code=code):
+                original = FakeAPI().call
+                def rejected(method, path, params=None, body=None):
+                    if method == 'POST' and path.endswith('/train'):
+                        raise ApiError('response suppressed', code=code)
+                    return original(method, path, params, body)
+                self.api.call = rejected
+                spec = prepare_task_spec(dict(self.spec, run_id='rejected_' + str(index)), PROFILE)
+                result = self.client.submit(spec, execute=True, experimental=True)
+                known = code != 'IRESOURCE_UNCLASSIFIED_FAILURE'
+                self.assertEqual(result['state'], 'REJECTED' if known else 'UNKNOWN')
+                self.assertEqual(result['resource_released'], known)
 
     def test_name_collision_requires_matching_fingerprint(self):
         self.api.raise_after_create = True

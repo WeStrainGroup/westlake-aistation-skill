@@ -269,6 +269,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(recovered['resource_released'])
 
     def test_stale_pid_does_not_reuse_an_unrelated_process(self):
+        self.cluster.profile['credential_mode'] = 'system-store'
         self.cluster.registry.update('example',supervisor_pid=os.getpid())
         self.cluster.plan=Mock(return_value={})
         process=Mock(pid=424242);process.poll.return_value=0
@@ -279,6 +280,27 @@ class RuntimeTests(unittest.TestCase):
         command=spawn.call_args.args[0]
         self.assertIn('--profile',command);self.assertIn('--non-interactive',command)
         self.assertNotIn('ephemeral-test-value',command)
+        self.assertIn('--use-keychain', command)
+
+    def test_detached_controller_cannot_use_a_prompt_process_memory_cache(self):
+        with patch('cluster.get_password', return_value='ephemeral-test-value') as read, \
+             patch('cluster.subprocess.Popen') as spawn:
+            with self.assertRaisesRegex(RuntimeError, 'explicit system-store opt-in'):
+                self.cluster.submit(self.spec)
+            read.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_explicit_system_store_choice_reaches_detached_child(self):
+        self.cluster.profile['credential_mode'] = 'system-store'
+        self.cluster.plan = Mock(return_value={})
+        process = Mock(pid=424242); process.poll.return_value = 0
+        with patch('cluster.get_password', return_value='ephemeral-test-value'), \
+             patch('cluster.subprocess.Popen', return_value=process) as spawn:
+            self.cluster.submit(self.spec)
+        command = spawn.call_args.args[0]
+        self.assertIn('--use-keychain', command)
+        self.assertLess(command.index('--use-keychain'), command.index('run'))
+        self.assertNotIn('ephemeral-test-value', command)
 
     def test_ambiguous_launch_never_sends_second_nohup(self):
         self.allocated(launch_attempted=True)

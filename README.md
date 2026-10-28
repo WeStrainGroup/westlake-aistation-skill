@@ -1,14 +1,12 @@
 # Westlake AIStation Skill
 
-按西湖大学 AIStation 手册组织开发调试、资源检查、短任务运行和正式训练准备和原生接口诊断。支持命令行，也可作为 Codex Skill 使用；每个人使用自己的账号和连接配置。
+通过命令行使用西湖大学 AIStation：开发调试、正式任务提交、日志监控、结果核验与资源释放。每个人使用自己的账号；这是社区适配器，不是官方 SDK，也不是 Slurm 客户端。
 
-Community CLI and Codex skill. This is not an official university SDK, and the manual does not promise compatibility with these observed API endpoints.
+**v0.3.0 已通过任务管理的真实 1×V100 验证：CUDA 矩阵计算、持久结果与回执回读、SHA-256 核验、任务终态及临时 CPU 环境释放。** 单节点多 GPU 可申请，程序须自行使用这些卡；多节点 DDP 和批量调度尚未实现。
 
-**预览版 `v0.2.0-preview.3`：公开改版尚未取得实机 GPU 全流程 PASS。此前检查通过了资源申请和实际 V100 型号核验，但共享目录创建超时；测试资源已释放。自动测试通过不能替代自己部署的小任务验证。**
+## 安装与更新
 
-## 安装
-
-需要 macOS 或 Linux、Python 3.11+，以及可访问目标 AIStation 的网络。远端镜像需提供 Python 3、SSH/SFTP、`timeout` 和 `sha256sum`；Windows 原生运行尚不支持。
+需要 macOS/Linux、Python 3.11+ 和校园网络或学校 VPN。
 
 ```bash
 git clone https://github.com/WeStrainGroup/westlake-aistation-skill.git
@@ -17,105 +15,62 @@ python3 -m venv scripts/.venv
 scripts/.venv/bin/python -m pip install -r scripts/requirements.txt
 scripts/.venv/bin/python scripts/install_local.py \
   --runtime-python "$PWD/scripts/.venv/bin/python"
-~/.codex/skills/westlake-aistation/scripts/wlai --version
 ```
 
-安装器保存不可变版本并原子切换本机 skill，保留私有配置。普通 CLI 也可直接使用源码目录的 `scripts/wlai`。已有旧 CLI 入口时，用 `--cli-path /absolute/old/wlai` 同步该入口；只替换并备份入口文件，不改动旁边的配置、证书、数据和状态。`--profile`、`--state-root` 可设置包装器的默认私有配置与共享状态根目录，不读取或复制凭据。
+安装器保存不可变源码快照，原子更新本地 skill。已有旧 CLI 时附加 `--cli-path /absolute/old/wlai`，只替换并备份入口，不覆盖私有配置、证书、数据和旧记录。**每次 GitHub 发布后都要同步本机 skill 和旧入口，并核对相同提交。** 详见 [安装、更新与回滚](references/usage.md#installation-and-updates)。
 
-**每次 GitHub 更新后，都要安装同一提交并核对本机版本。** 不在运行中的控制器代码目录内 `git pull`。升级、版本核验与回滚命令见 [使用参考](references/usage.md#installation-and-updates)。旧完整源码安装的迁移需要先结束旧控制器；安装器默认拒绝直接热改。
-
-## 首次配置
-
-首次账号先按平台要求修改初始密码。校外使用学校 VPN，WebVPN 无效。门户和证书请从可信渠道获得，不使用他人的配置。[官方登录说明](https://hpc.westlake.edu.cn/document/ai/aistation/2.account.html)
-
-先只配置连接，再查询自己可用的资源：
+## 直接输入账号密码
 
 ```bash
 scripts/wlai init --connection-only --server-cert /absolute/trusted-server.pem
-scripts/wlai login --remember
+scripts/wlai login
 scripts/wlai resources --group all --format table
-scripts/wlai configure
-scripts/wlai doctor
-```
-
-`--server-cert` 从使用者提供的单张服务器 PEM 计算证书指纹，不会下载证书并自动信任。`configure` 补全资源组 ID、镜像、GPU 型号、SSH 主机指纹和存储选择；SSH 指纹也需要通过可信渠道核实。若已经掌握这些设置，可直接运行完整向导 `scripts/wlai init`。
-
-默认使用个人 master 目录；也可明确选择 SSD `ssdwork`。SSD 有组配额且没有免费存储容量，工具不会因 master 慢而自动切换或复制数据。其他挂载需要使用者明确配置并通过挂载检查。[存储与配额](https://hpc.westlake.edu.cn/document/ai/aistation/4.data_file.html#id2) · [存储计费](https://hpc.westlake.edu.cn/document/ai/aistation/3.resource.html#storage-billing-rules)
-
-密码隐藏输入，默认不保存；上面的 `--remember` 是可选的系统凭据库保存。macOS 使用钥匙串；Linux 可安装可选依赖 `keyring` 并启用受支持的系统后端。不保存密码时，前台 `run` 可隐藏询问；后台 `submit` 需要系统凭据库。密码不进入配置、命令参数或环境变量，令牌不保存到磁盘。
-
-## 日常开发调试
-
-用自己的脚本生成作业文件，再检查计划：
-
-```bash
-scripts/wlai job --script ./main.py --minutes 30 --out job.json -- --input /remote/input.dat
-scripts/wlai plan --spec job.json
-scripts/wlai plan --spec job.json --online
-scripts/wlai run --spec job.json --execute
-```
-
-`job` 只生成文件。`plan` 默认离线检查参数、上传大小和完整时间预算，**没有查询实时资源或验证远端可用性**；`--online` 再查询资源。实际执行会重新查资源、核验挂载并检查小写入，之后才启动代码。CPU 和 GPU 必须在同一节点同时满足。
-
-需要后台控制器时，把最后一条换成 `submit --spec job.json --execute`。控制器在本机运行，需保持开机联网；其他 agent 使用同一配置即可共享记录：
-
-```bash
-scripts/wlai runs
-scripts/wlai status --run-id RUN_ID
-scripts/wlai logs --run-id RUN_ID
-scripts/wlai metrics --run-id RUN_ID
-scripts/wlai watch --run-id RUN_ID
-```
-
-`RUN_ID` 使用生成或提交结果中的运行 ID。脚本、参数和资源变更后使用新 ID。结果要写入已核验的个人持久挂载；需要下载结果时，在作业 JSON 的 `downloads` 中明确列出路径。上传和下载核对 SHA-256，并拒绝覆盖不同的既有文件。详见 [作业格式与恢复](references/usage.md)。
-
-## 正式训练
-
-手册的正常流程是先在开发环境调试，再到“业务管理 → 任务管理”提交正式任务。开发环境统一最长四小时；正式任务时限取决于资源组，许多组为五天，应使用 checkpoint。[官方任务说明](https://hpc.westlake.edu.cn/document/ai/aistation/6.task.html)
-
-先把调试通过的代码、环境和数据一次性放入已核验的持久目录，再生成原生任务计划：
-
-```bash
-scripts/wlai groups --purpose training
+scripts/wlai configure --purpose development
 scripts/wlai configure --purpose training
+```
+
+初始化时直接输入自己的账号。在线命令默认直接提示密码，以隐藏输入保护终端记录；**默认不访问钥匙串**，密码只在当前进程内存中使用。`login` 验证账号，不保存密码；系统凭据库仅是主动选择的可选功能，见使用参考。
+
+门户、服务器证书和容器 SSH 指纹必须由使用者通过可信渠道核实。工具不会下载证书后自动信任。首次账号请先按手册修改初始密码；WebVPN 不适用于这个入口。
+
+## 正式 GPU 任务
+
+先把代码、依赖和数据放入个人持久目录。训练通过“任务管理”运行，不受开发环境四小时租期约束，但仍须遵守所选训练组时限并保存 checkpoint。
+
+```bash
 scripts/wlai job --purpose training --remote-script /personal/train.py \
-  --minutes 1440 --out training-job.json -- --output '{run_dir}/results'
-scripts/wlai task-plan --spec training-job.json
-scripts/wlai task-plan --spec training-job.json --online
+  --gpus 1 --cpus 12 --minutes 720 --out training.json -- --output '{run_dir}/results'
+scripts/wlai task-stage --spec training.json --out training.staged.json --execute
+scripts/wlai task-plan --spec training.staged.json --online
+scripts/wlai task-submit --spec training.staged.json --execute
+scripts/wlai task-watch --run-id RUN_ID --timeout 600
 ```
 
-这几条命令不提交任务。命令长度受部署限制；若内嵌检查器被平台拒绝，可预置同版本检查器并通过 SHA-256 校验后用短命令启动，见 [原生任务参考](references/usage.md#native-task-management-plan-and-bounded-diagnostics)。
+`task-stage` 使用短暂的 **1 CPU / 0 GPU** 调试环境，上传并校验检查器和参数文件，然后确认释放；它不运行科学计算。需要配置开发组和可信 SSH 指纹。真正训练由独立的原生任务执行，不依赖该调试环境或本机持续在线。代码与大数据只需预置一次；这个步骤上传的是小型启动文件。
 
-原生任务有独立注册表与 `task-status/task-logs/task-watch/task-stop/task-reconcile`；无需开发环境 SSH。`task-watch` 的超时只停止本机观察，不取消平台任务。输出留在持久盘，当前不会自动下载；多节点 DDP 和批量派发尚未实现。
+默认命令预算是客户端保守设置的 1000 字节，超限在联网前拒绝并提示 `task-stage`，避免把约 5.8 KB 的内嵌检查器发给平台。短命令不含会被平台改写的双引号，启动前校验两份文件的完整 SHA-256。检查器核验真实 GPU 数量/型号和持久挂载后才启动程序。
 
-**当前原生 GPU 创建仍不满足生产上线条件。** 本轮通过官方表单精确转发的 1 GPU 请求也被服务端改成 CPU/0 GPU，CUDA 验证失败。默认 `task-submit --spec training-job.json --execute` 会拒绝新增原生任务；仅已获授权的小型诊断可显式使用 `--experimental-native`。客户端核对平台回读资源，发现不符会停止本次新任务；容器内 guard 还会验证真实 GPU 和持久挂载，未通过就不启动科学代码。不能凭“创建成功”宣称申请到了 GPU。
-
-`task-guide --spec training-job.json --out task-guide.md` 仍可导出人工网页清单。网页提交也必须核验实际硬件。当前限制不能通过把长训练转到开发环境来规避。生产批次应等待此部署的 GPU 实测通过；不要为测试重复投递正式训练。
-
-## 挂载与传输检查
-
-已有调试环境时，可检查挂载、一次小写入、延迟和文件系统容量：
+创建请求省略 `taskType`：它是列表/前端路由使用的分类字段，反写到普通创建请求会把 GPU 训练变成 CPU 数据处理任务。此前的“平台 GPU 故障”判断已被本次单变量实测纠正。
 
 ```bash
-scripts/wlai storage-check --run-id RUN_ID
+scripts/wlai task-status --run-id RUN_ID
+scripts/wlai task-logs --run-id RUN_ID
+scripts/wlai task-reconcile --run-id RUN_ID
+scripts/wlai task-stop --run-id RUN_ID
 ```
 
-它不会另行申请环境。`df` 可用空间不能证明实验室组配额充足；出现无法写入或明显卡顿时，应检查组配额及存储服务，而不是反复申请 GPU。大数据尽量先传好再占用 GPU。手册推荐大文件走独立 SFTP，并提醒开发环境有限时；当前工具的独立存储 SFTP 仍不提供自动化支持。[文件传输说明](https://hpc.westlake.edu.cn/document/ai/aistation/4.data_file.html#sftp)
+本机观察超时不会取消平台任务。`UNKNOWN` 表示网络等原因让创建结果不明，先对账、不重复 POST；平台明确参数拒绝记为 `REJECTED`。平台成功但缺少有效终态检查器回执记为 `COMPLETED_UNVERIFIED`。科学结果仍须检查，退出码零不代表研究结论正确。
 
-## 稳定性与边界
-
-- HTTPS、SSH/SFTP 复用连接；只读请求有限重试，创建资源的写请求不自动重发。
-- 每个运行独立加锁，状态按门户和账号隔离；计算、回收和释放分别确认。
-- 准备、传输、程序、回收和清理使用完整时间预算，不能超过开发环境四小时。13,800 秒是客户端程序保护上限，不是手册额外规定；实际可用程序时长还受其他阶段预算限制。
-- 远端独立看门狗限制程序时长；状态使用原子替换，不承诺断电耐久性。短时断线可在原期限内恢复，长期离线不保证立即回收或释放。
-- 共享存储操作可能有明显延迟，不保证集群 I/O 吞吐。已接受暂停请求不等于资源已释放。
-
-本仓库不包含作者账号、密码、内网地址、证书、资源组 ID 或运行历史。手册规定、客户端保护和部署实测的区别，见 [手册对照](references/manual.md)。
-
-## 测试
+## 开发调试
 
 ```bash
-scripts/.venv/bin/python -m unittest discover -s tests -v
+scripts/wlai job --script ./main.py --minutes 30 --out debug.json
+scripts/wlai plan --spec debug.json --online
+scripts/wlai run --spec debug.json --execute
 ```
 
-自动测试不需要账号、网络或 GPU。持续集成结果见 GitHub Actions；MIT License。
+开发环境总租期最多四小时，准备、传输、程序、回收和清理都计入。后台开发控制器依赖本机持续运行，区别于平台管理的原生任务。结果写个人真实挂载；默认 master，SSD `ssdwork` 需明确选择，有独立配额与费用。
+
+[官方手册对照](references/manual.md) · [完整使用与恢复](references/usage.md)
+
+本仓库不包含作者账号、密码、内网地址、证书、资源组 ID 或私有运行历史。自动测试无须账号、网络或 GPU；MIT License。

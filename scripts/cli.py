@@ -11,10 +11,11 @@ import tempfile
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument('--version', action='version', version='westlake-aistation 0.2.0-preview.3')
+    root.add_argument('--version', action='version', version='westlake-aistation 0.3.0')
     root.add_argument('--profile', type=Path, help='Private, nonsecret connection profile')
     root.add_argument('--state-dir', type=Path, help='Override the account-scoped run registry')
     root.add_argument('--non-interactive', action='store_true', help='Never prompt for a password')
+    root.add_argument('--use-keychain', action='store_true', help='Explicitly read an optional system-store credential; default is direct password input')
     commands = root.add_subparsers(dest='command', required=True)
     init = commands.add_parser('init', help='Create a private connection profile; no password is saved')
     init.add_argument('--from-file', type=Path, help='Validate and copy a completed profile template')
@@ -34,6 +35,7 @@ def parser():
     configure.add_argument('--storage-mount')
     configure.add_argument('--persistent-root')
     configure.add_argument('--training-group-id')
+    configure.add_argument('--credential-mode', choices=('prompt', 'system-store'), help='Default is prompt; system-store is an explicit opt-in')
     login = commands.add_parser('login', help='Verify credentials using hidden password input')
     login.add_argument('--remember', action='store_true', help='Save in the system credential store after login succeeds')
     doctor = commands.add_parser('doctor', help='Validate local setup without allocating resources')
@@ -77,6 +79,10 @@ def parser():
     groups = commands.add_parser('groups', help='List groups actually authorized for the selected workload')
     groups.add_argument('--purpose', choices=('development', 'training'), default='training')
     groups.add_argument('--format', choices=('json', 'table'), default='table')
+    stage = commands.add_parser('task-stage', help='Prepare short native startup files through a temporary CPU-only environment')
+    stage.add_argument('--spec', type=Path, required=True)
+    stage.add_argument('--out', type=Path, required=True)
+    stage.add_argument('--execute', action='store_true')
     for name in ('task-plan', 'task-submit'):
         task = commands.add_parser(name, help='Platform-owned native training task')
         task.add_argument('--spec', type=Path, required=True)
@@ -85,8 +91,7 @@ def parser():
         else:
             task.add_argument('--execute', action='store_true')
             task.add_argument('--queue', action='store_true', help='Explicitly allow a compatible busy group to queue')
-            task.add_argument('--experimental-native', action='store_true',
-                              help='Diagnostic opt-in for an unverified native API; never implies production readiness')
+            task.add_argument('--experimental-native', action='store_true', help='Compatibility flag; native submission no longer requires it')
     commands.add_parser('task-runs', help='Read native task records without authentication')
     for name in ('task-status', 'task-logs', 'task-stop', 'task-reconcile', 'task-watch'):
         task = commands.add_parser(name)
@@ -144,7 +149,7 @@ def initialize(args):
     write_profile(target, profile)
     return {'configured': True, 'profile': str(target), 'password_saved': False,
             'execution_ready': not bool(execution_requirements(profile)),
-            'next': 'login --remember; resources --group all --format table; configure'}
+            'next': 'resources --group all --format table; configure (each online command prompts directly)'}
 
 
 def _execution_prompts(current, purpose='development'):
@@ -175,7 +180,7 @@ def configure_profile(args):
     target = Path(previous['_path'])
     values = {key: value for key, value in previous.items() if not key.startswith('_')}
     fields = ('development_group_id', 'image', 'card_type', 'ssh_host_fingerprint', 'remote_python',
-              'storage', 'storage_mount', 'persistent_root', 'training_group_id')
+              'storage', 'storage_mount', 'persistent_root', 'training_group_id', 'credential_mode')
     changes = {key: getattr(args, key) for key in fields if getattr(args, key, None) is not None}
     if args.group_id is not None:
         key = 'training_group_id' if args.purpose == 'training' else 'development_group_id'
@@ -227,6 +232,8 @@ def error_details(error):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    from credentials import clear_session_passwords
+    clear_session_passwords()
     if args.command == 'init':
         result = initialize(args)
     elif args.command == 'configure':
@@ -235,11 +242,25 @@ def main(argv=None):
         from config import execution_requirements, load_profile, state_directory
         execution_commands = {'plan', 'run', 'submit', 'env-create', 'exec', 'put', 'get', 'metrics', 'storage-check'}
         profile = load_profile(args.profile, require_execution=args.command in execution_commands)
+        if args.use_keychain:
+            profile['credential_mode'] = 'system-store'
         if args.command.startswith('task-') and args.command != 'task-guide':
             from native import NativeTasks, prepare_task_spec
             tasks = NativeTasks(profile=profile, state_dir=args.state_dir, interactive=not args.non_interactive)
             try:
-                if args.command == 'task-runs':
+                if args.command == 'task-stage':
+                    from staging import stage_task
+                    from jobs import write_json_exclusive
+                    if args.out.exists() or args.out.is_symlink():
+                        raise FileExistsError('Staged specification destination already exists')
+                    result = stage_task(profile, json.loads(args.spec.read_text()),
+                                        args.state_dir or state_directory(profile),
+                                        interactive=not args.non_interactive, execute=args.execute)
+                    if args.execute:
+                        write_json_exclusive(args.out, result['staged_spec'])
+                        result['written'] = str(args.out.resolve())
+                    result['next'] = 'task-plan --spec ' + str(args.out) if args.execute else 'Repeat task-stage with --execute to stage files and write the output spec'
+                elif args.command == 'task-runs':
                     result = tasks.registry.list()
                 elif args.command in ('task-plan', 'task-submit'):
                     spec = prepare_task_spec(json.loads(args.spec.read_text()), profile)
@@ -296,14 +317,7 @@ def main(argv=None):
         elif args.command == 'login':
             from api import AIStation
             from credentials import get_password, store_password
-            if args.non_interactive:
-                password = get_password(profile, interactive=False)
-            else:
-                if not sys.stdin.isatty():
-                    raise RuntimeError('Login needs a terminal for hidden password input')
-                password = getpass.getpass('AIStation password (hidden): ')
-                if not password:
-                    raise ValueError('Password must not be empty')
+            password = get_password(profile, interactive=not args.non_interactive)
             client = AIStation(profile)
             try:
                 client.login(profile['account'], password)
@@ -352,7 +366,7 @@ def main(argv=None):
                 else:
                     from credentials import password_available
                     if not password_available(profile):
-                        raise RuntimeError('Background submit requires a system credential store; run login --remember, or use foreground run')
+                        raise RuntimeError('Background development submit requires explicit system-store opt-in; use foreground run for direct password input, or --use-keychain after login --remember')
                     result = cluster.submit(spec)
             elif args.command == 'env-create':
                 source = {'run_id': args.run_id, 'argv': ['/bin/true'],
@@ -440,7 +454,7 @@ def main(argv=None):
         print(group_table(result))
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    if isinstance(result, dict) and result.get('state') in ('FAILED', 'TIMED_OUT', 'BLOCKED', 'COLLECTION_FAILED', 'UNKNOWN', 'RESOURCE_MISMATCH', 'DELETED', 'COMPLETED_UNVERIFIED'):
+    if isinstance(result, dict) and result.get('state') in ('FAILED', 'TIMED_OUT', 'BLOCKED', 'COLLECTION_FAILED', 'UNKNOWN', 'RESOURCE_MISMATCH', 'COMMAND_MISMATCH', 'REJECTED', 'DELETED', 'COMPLETED_UNVERIFIED'):
         return 2
     if isinstance(result, dict) and result.get('missing_dependencies'):
         return 1

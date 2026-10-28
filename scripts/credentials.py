@@ -1,4 +1,4 @@
-"""Hidden password input and optional OS credential stores; no plaintext fallback."""
+"""Direct hidden input by default; explicit optional OS credential stores."""
 import ctypes
 import getpass
 import hashlib
@@ -7,6 +7,22 @@ import sys
 
 class CredentialError(RuntimeError):
     """A credential is missing or the system store is unavailable."""
+
+
+_SESSION_PASSWORDS = {}
+
+
+def clear_session_passwords():
+    """Forget credentials retained only for the current command's API refreshes."""
+    _SESSION_PASSWORDS.clear()
+
+
+def _session_key(profile):
+    return profile['portal'].rstrip('/'), profile['account']
+
+
+def uses_system_store(profile):
+    return profile.get('credential_mode', 'prompt') == 'system-store'
 
 
 def _service(profile):
@@ -94,19 +110,25 @@ def _read_stored(profile):
 
 
 def get_password(profile, interactive=True):
-    password = _read_stored(profile)
-    if password:
-        return password
+    key = _session_key(profile)
+    if key in _SESSION_PASSWORDS:
+        return _SESSION_PASSWORDS[key]
+    if uses_system_store(profile):
+        password = _read_stored(profile)
+        if password:
+            _SESSION_PASSWORDS[key] = password
+            return password
     if not interactive:
-        raise CredentialError("No saved system-store credential; use login --remember before background submission")
+        raise CredentialError("Direct password input needs an interactive terminal; use a foreground command, or explicitly opt into --use-keychain")
     if not sys.stdin.isatty():
-        raise CredentialError("Hidden password input requires an interactive terminal; use login --remember")
+        raise CredentialError("Direct password input requires an interactive terminal; passwords are not read from files, pipes or environment variables")
     try:
-        password = getpass.getpass("AIStation password (hidden): ")
+        password = getpass.getpass("AIStation password for " + profile['account'] + " (hidden): ")
     except (EOFError, KeyboardInterrupt):
         raise CredentialError("Password input cancelled") from None
     if not password:
         raise CredentialError("Password must not be empty")
+    _SESSION_PASSWORDS[key] = password
     return password
 
 
@@ -125,4 +147,5 @@ def store_password(profile, password):
 
 
 def password_available(profile):
-    return bool(_read_stored(profile))
+    # A detached controller cannot inherit this process's in-memory password.
+    return uses_system_store(profile) and bool(_read_stored(profile))

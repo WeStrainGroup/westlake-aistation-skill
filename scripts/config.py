@@ -17,7 +17,7 @@ _CONNECTION_REQUIRED = {"portal", "account", "ca_file", "certificate_sha256"}
 _EXECUTION_REQUIRED = {"ssh_host_fingerprint", "development_group_id", "image"}
 _REQUIRED = _CONNECTION_REQUIRED | _EXECUTION_REQUIRED | {"persistent_root"}
 _OPTIONAL = {"framework", "card_type", "ssh_host", "ssh_user", "remote_python",
-             "max_environment_seconds", "training_group_id", "storage", "storage_mount"}
+             "max_environment_seconds", "training_group_id", "storage", "storage_mount", "credential_mode"}
 _SECRET_FIELDS = {"password", "passwd", "token", "access_token", "authorization", "secret"}
 
 
@@ -46,6 +46,10 @@ def validate_profile(source, base_dir=None, require_execution=True):
     if missing:
         raise ConfigurationError("Missing profile fields: " + ", ".join(sorted(missing)))
     profile = {key: _text(source[key], key) for key in _CONNECTION_REQUIRED}
+    mode = source.get('credential_mode', 'prompt')
+    if mode not in ('prompt', 'system-store'):
+        raise ConfigurationError('credential_mode must be prompt or system-store')
+    profile['credential_mode'] = mode
     if profile['account'] in ('.', '..') or any(char in profile['account'] for char in ('/', '\\')):
         raise ConfigurationError('account cannot contain path separators or parent components')
     for key in _EXECUTION_REQUIRED:
